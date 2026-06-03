@@ -728,14 +728,19 @@ class ProScalperEngine:
         return SessionState.CLOSED
 
     async def startup(self) -> None:
-        try:
+        strict_startup_auth = os.getenv("STRICT_STARTUP_AUTH", "false").lower() == "true"
+        if strict_startup_auth:
             self.client.authenticate()
             await self._refresh_broker_health()
-        except Exception as exc:
-            self.runtime.broker_state = BrokerState.DISCONNECTED
-            self.runtime.websocket_alive = False
-            self.set_safe_mode(True, f"Startup auth unavailable: {exc}")
-            logger.warning("Starting in SAFE MODE without broker session: %s", exc)
+        else:
+            try:
+                self.client.authenticate()
+                await self._refresh_broker_health()
+            except Exception as exc:
+                self.runtime.broker_state = BrokerState.DISCONNECTED
+                self.runtime.websocket_alive = False
+                self.set_safe_mode(True, f"Startup auth unavailable: {exc}")
+                logger.warning("Starting in SAFE MODE without broker session: %s", exc)
         asyncio.create_task(self._websocket_watchdog_loop())
         asyncio.create_task(self._portfolio_refresh_loop())
         asyncio.create_task(self._market_analysis_loop())
