@@ -1,0 +1,10 @@
+node_modules/
+dist/
+__pycache__/
+*.py[cod]
+.venv/
+pro_scalper.db
+.env
+.env.local
+*.db-shm
+*.db-wal
