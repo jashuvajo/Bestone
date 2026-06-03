@@ -291,6 +291,9 @@ export default function App() {
 
   const backtestRows = payload.backtesting?.recent_replay || [];
   const replayPoint = backtestRows[replayCursor] || {};
+  const advisory = payload.advisory || {};
+  const advisorySuggestions = advisory.suggestions || [];
+  const advisoryBacktest = advisory.backtest || {};
 
   const postConfig = async (body) => {
     if (!API_URL) return;
@@ -547,6 +550,7 @@ export default function App() {
 
               <div className={panelClass}>
                 <div className={tiny}>Strategy Router</div>
+                <div className="mt-2 text-xs text-cyan-300">Mode: {advisory.mode || "MONITORING"}</div>
                 <div className="mt-2 space-y-1 text-xs">
                   {routeChecks.map((r) => (
                     <div key={r.k} className={`flex justify-between rounded px-2 py-1 ${r.pass ? "bg-emerald-900/30 text-emerald-300" : "bg-rose-900/30 text-rose-300"}`}>
@@ -555,6 +559,13 @@ export default function App() {
                   ))}
                 </div>
                 <div className="mt-2 text-xs">Cross-corr: {Number(perf.cross_symbol_correlation || 0).toFixed(3)}</div>
+                <div className="mt-2 space-y-1 text-xs">
+                  {advisorySuggestions.slice(0, 2).map((s) => (
+                    <div key={`${s.symbol}-${s.timestamp}`} className="rounded bg-slate-950/70 px-2 py-1">
+                      {s.symbol}: <span className={s.action === "BUY_CALL" ? "text-emerald-300" : "text-amber-300"}>{s.action}</span> | TQS {Number(s.tqs || 0).toFixed(1)}
+                    </div>
+                  ))}
+                </div>
               </div>
 
               <div className={panelClass}>
@@ -615,6 +626,12 @@ export default function App() {
                 <div className={tiny}>Backtesting</div>
                 <div className="mt-2 space-y-2 text-xs">
                   <div>Stored ticks: {payload.backtesting?.total_records || 0}</div>
+                  <div>Advisory updated: {formatTs(advisory.updated_at || 0)}</div>
+                  <div className="rounded bg-slate-950/70 p-2">
+                    <div>NIFTY win rate: {Number(advisoryBacktest.symbols?.NIFTY?.win_rate || 0).toFixed(1)}%</div>
+                    <div>SENSEX win rate: {Number(advisoryBacktest.symbols?.SENSEX?.win_rate || 0).toFixed(1)}%</div>
+                    <div>Total window ticks: {Number(advisoryBacktest.window_ticks || 0)}</div>
+                  </div>
                   <div className="flex items-center gap-2">
                     <button className="rounded bg-slate-800 px-2 py-1" onClick={() => setReplayCursor((v) => Math.max(v - 1, 0))}>Prev</button>
                     <button className="rounded bg-slate-800 px-2 py-1" onClick={() => setReplayCursor((v) => Math.min(v + 1, Math.max(backtestRows.length - 1, 0)))}>Next</button>

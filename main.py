@@ -727,6 +727,13 @@ class ProScalperEngine:
         self.broker_diagnostics: Dict[str, Any] = {"last_profile": {}, "last_portfolio_error": "", "last_analysis_error": ""}
         self.cached_state_loaded = False
         self.last_cached_state_ts = 0.0
+        self.advisory_state: Dict[str, Any] = {
+            "mode": "MONITORING",
+            "suggestions": [],
+            "backtest": {},
+            "updated_at": 0.0,
+        }
+        self.last_advisory_backtest_ts = 0.0
 
     def _restore_cached_market_state(self) -> None:
         restored = 0
@@ -1527,6 +1534,7 @@ class ProScalperEngine:
                     "last_cached_state_ts": self.last_cached_state_ts,
                     "timestamp": time.time(),
                 }
+                self._update_advisory_state()
                 self.runtime.last_analysis_ts = time.time()
                 latest_snapshot_ts = max((x.updated_at for x in self.snapshots.values()), default=0.0)
                 self.runtime.stale_feed = (time.time() - latest_snapshot_ts) > self.risk.stale_data_seconds
@@ -1543,6 +1551,124 @@ class ProScalperEngine:
                 self.set_safe_mode(True, f"Analysis loop failed: {err}")
             elapsed = time.time() - started
             await asyncio.sleep(max(0.0, POLL_INTERVAL_SECONDS - elapsed))
+
+    def _suggest_trade(self, symbol: str) -> Dict[str, Any]:
+        signal = self.last_signal.get(symbol, {})
+        snapshot = self.snapshots[symbol]
+        features = signal.get("features", {})
+        ai_conf = float(signal.get("ai", {}).get("ai_confidence", 0.0))
+        tqs = float(signal.get("tqs", 0.0))
+
+        checks = {
+            "momentum": features.get("momentum_score", 0.0) > 0.12,
+            "delta_spike": features.get("delta_velocity", 0.0) > 0.0006,
+            "volume_expansion": features.get("volume_acceleration", 0.0) > 0.05,
+            "spread_tight": features.get("spread_quality", 0.0) > 0.38,
+            "vwap_align": features.get("vwap_alignment", 0.0) > 0,
+            "gamma_align": features.get("gamma_bias", 0.0) > -0.2,
+            "ai_threshold": ai_conf >= self.risk.ai_threshold,
+            "tqs_threshold": tqs >= self.risk.ai_threshold,
+        }
+        pass_count = sum(1 for v in checks.values() if v)
+        action = "BUY_CALL" if pass_count >= 7 else "WAIT"
+        suggested_qty = 0
+        if action == "BUY_CALL" and snapshot.call_ltp:
+            suggested_qty = self._trade_qty(symbol, snapshot.call_ltp)
+
+        return {
+            "symbol": symbol,
+            "action": action,
+            "pass_count": pass_count,
+            "checks": checks,
+            "tqs": tqs,
+            "ai_confidence": ai_conf,
+            "atm_strike": snapshot.atm_strike,
+            "call_ltp": snapshot.call_ltp,
+            "expected_move": float(signal.get("ai", {}).get("expected_move", 0.0)),
+            "suggested_quantity": suggested_qty,
+            "timestamp": time.time(),
+        }
+
+    def _compute_advisory_backtest(self) -> Dict[str, Any]:
+        recent = self.db.recent_ticks(limit=1200)
+        by_symbol = {"NIFTY": [], "SENSEX": []}
+        for row in recent:
+            sym = row.get("symbol")
+            if sym in by_symbol and row.get("call_ltp") is not None and row.get("tqs") is not None:
+                by_symbol[sym].append(row)
+
+        summary: Dict[str, Any] = {"window_ticks": len(recent), "symbols": {}}
+        for symbol, rows in by_symbol.items():
+            rows = sorted(rows, key=lambda x: float(x.get("ts") or 0.0))
+            if len(rows) < 20:
+                summary["symbols"][symbol] = {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "avg_move": 0.0}
+                continue
+
+            trades = 0
+            wins = 0
+            losses = 0
+            moves: List[float] = []
+            threshold = float(self.risk.ai_threshold)
+            for i in range(len(rows) - 6):
+                entry = rows[i]
+                entry_tqs = float(entry.get("tqs") or 0.0)
+                entry_px = float(entry.get("call_ltp") or 0.0)
+                if entry_tqs < threshold or entry_px <= 0:
+                    continue
+                future = rows[i + 1 : i + 6]
+                if not future:
+                    continue
+                max_move = max(float(x.get("call_ltp") or entry_px) - entry_px for x in future)
+                min_move = min(float(x.get("call_ltp") or entry_px) - entry_px for x in future)
+                trades += 1
+                moves.append(max_move)
+                if max_move >= 5.0:
+                    wins += 1
+                elif min_move <= -3.0:
+                    losses += 1
+            win_rate = (wins / trades * 100.0) if trades else 0.0
+            avg_move = float(np.mean(moves)) if moves else 0.0
+            summary["symbols"][symbol] = {
+                "trades": trades,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": win_rate,
+                "avg_move": avg_move,
+            }
+        summary["updated_at"] = time.time()
+        return summary
+
+    def _update_advisory_state(self) -> None:
+        session = self.session_state()
+        live_data_available = self.runtime.rest_api_alive and self.runtime.websocket_alive
+        if session == SessionState.LIVE and live_data_available and not self.runtime.auto_trading_enabled:
+            suggestions = [self._suggest_trade(symbol) for symbol in ["NIFTY", "SENSEX"]]
+            if time.time() - self.last_advisory_backtest_ts > 20:
+                self.advisory_state["backtest"] = self._compute_advisory_backtest()
+                self.last_advisory_backtest_ts = time.time()
+            self.advisory_state.update(
+                {
+                    "mode": "ADVISORY_BACKTEST",
+                    "suggestions": suggestions,
+                    "updated_at": time.time(),
+                }
+            )
+        elif self.runtime.auto_trading_enabled and not self.runtime.safe_mode:
+            self.advisory_state.update(
+                {
+                    "mode": "AUTO_EXECUTION",
+                    "suggestions": [],
+                    "updated_at": time.time(),
+                }
+            )
+        else:
+            self.advisory_state.update(
+                {
+                    "mode": "MONITORING",
+                    "suggestions": [],
+                    "updated_at": time.time(),
+                }
+            )
 
     def _portfolio_exposure_pct(self) -> float:
         exposure = sum(trade.entry_price * trade.quantity for trade in self.active_trades.values())
@@ -1821,6 +1947,9 @@ class ProScalperEngine:
                 if self.runtime.safe_mode:
                     await asyncio.sleep(1)
                     continue
+                if not self.runtime.auto_trading_enabled:
+                    await asyncio.sleep(1)
+                    continue
                 for symbol in ["NIFTY", "SENSEX"]:
                     open_for_symbol = [t for t in self.active_trades.values() if t.symbol == symbol]
                     if len(open_for_symbol) >= 2:
@@ -1928,6 +2057,7 @@ class ProScalperEngine:
             "recent_trades": [x.__dict__ for x in list(self.closed_trades)[-40:]],
             "heatmaps": self.heatmaps,
             "backtesting": self._backtesting_snapshot(),
+            "advisory": self.advisory_state,
             "cache": {"loaded": self.cached_state_loaded, "last_cached_ts": self.last_cached_state_ts},
             "broker_diagnostics": self.broker_diagnostics,
         }
