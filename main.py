@@ -85,11 +85,14 @@ class RuntimeFlags:
     broker_state: BrokerState = BrokerState.DISCONNECTED
     broker_reason: str = "Startup pending"
     websocket_alive: bool = False
+    rest_api_alive: bool = False
     api_latency_ms: float = 0.0
     websocket_latency_ms: float = 0.0
     stale_feed: bool = True
     last_ws_message_ts: float = 0.0
     last_analysis_ts: float = 0.0
+    last_rest_success_ts: float = 0.0
+    last_error: str = ""
 
 
 @dataclass
@@ -539,6 +542,25 @@ class DatabaseStore:
             for row in rows
         ]
 
+    def latest_symbol_state(self, symbol: str) -> Dict[str, Any]:
+        cursor = self._sqlite.execute(
+            """
+            SELECT ts, raw_json FROM ticks
+            WHERE symbol = ?
+            ORDER BY ts DESC
+            LIMIT 1
+            """,
+            (symbol,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        try:
+            raw = json.loads(row[1] or "{}")
+        except Exception:
+            raw = {}
+        return {"ts": row[0], "raw": raw}
+
 
 class ModelEngine:
     def __init__(self) -> None:
@@ -701,6 +723,49 @@ class ProScalperEngine:
         self.last_signal: Dict[str, Any] = {"NIFTY": {}, "SENSEX": {}}
         self.session_intelligence: Dict[str, Dict[str, Any]] = {"NIFTY": {}, "SENSEX": {}, "global": {}}
         self.backtest_cursor = 0
+        self.expiry_refresh_ts: Dict[str, float] = {"NIFTY": 0.0, "SENSEX": 0.0}
+        self.broker_diagnostics: Dict[str, Any] = {"last_profile": {}, "last_portfolio_error": "", "last_analysis_error": ""}
+        self.cached_state_loaded = False
+        self.last_cached_state_ts = 0.0
+        self.advisory_state: Dict[str, Any] = {
+            "mode": "MONITORING",
+            "suggestions": [],
+            "backtest": {},
+            "updated_at": 0.0,
+        }
+        self.last_advisory_backtest_ts = 0.0
+
+    def _restore_cached_market_state(self) -> None:
+        restored = 0
+        latest_ts = 0.0
+        for symbol in self.symbol_map:
+            cached = self.db.latest_symbol_state(symbol)
+            if not cached:
+                continue
+            raw = cached.get("raw", {})
+            snapshot_raw = raw.get("snapshot", {}) if isinstance(raw, dict) else {}
+            signal_raw = raw.get("signal", {}) if isinstance(raw, dict) else {}
+            ts = float(cached.get("ts") or 0.0)
+            snapshot = self.snapshots[symbol]
+            for field_name in snapshot.__dataclass_fields__.keys():
+                if field_name in snapshot_raw and snapshot_raw[field_name] is not None:
+                    setattr(snapshot, field_name, snapshot_raw[field_name])
+            snapshot.updated_at = max(snapshot.updated_at, ts)
+            if signal_raw:
+                self.last_signal[symbol] = signal_raw
+                if signal_raw.get("heatmap"):
+                    self.heatmaps[symbol] = signal_raw.get("heatmap", {})
+                if signal_raw.get("session_intelligence"):
+                    self.session_intelligence[symbol] = signal_raw.get("session_intelligence", {})
+            restored += 1
+            latest_ts = max(latest_ts, ts)
+
+        if restored > 0:
+            self.cached_state_loaded = True
+            self.last_cached_state_ts = latest_ts
+            if not self.runtime.rest_api_alive:
+                self.runtime.broker_reason = f"Using cached market state ({restored} symbols)"
+            logger.info("Loaded cached market state for %d symbols.", restored)
 
     def set_safe_mode(self, enabled: bool, reason: str) -> None:
         self.runtime.safe_mode = enabled
@@ -728,8 +793,22 @@ class ProScalperEngine:
         return SessionState.CLOSED
 
     async def startup(self) -> None:
-        self.client.authenticate()
-        await self._refresh_broker_health()
+        self._restore_cached_market_state()
+        strict_startup_auth = os.getenv("STRICT_STARTUP_AUTH", "false").lower() == "true"
+        if strict_startup_auth:
+            self.client.authenticate()
+            await self._refresh_broker_health()
+        else:
+            try:
+                self.client.authenticate()
+                await self._refresh_broker_health()
+            except Exception as exc:
+                self.runtime.broker_state = BrokerState.DISCONNECTED
+                self.runtime.websocket_alive = False
+                self.runtime.rest_api_alive = False
+                self.runtime.last_error = str(exc)
+                self.set_safe_mode(True, f"Startup auth unavailable: {exc}")
+                logger.warning("Starting in SAFE MODE without broker session: %s", exc)
         asyncio.create_task(self._websocket_watchdog_loop())
         asyncio.create_task(self._portfolio_refresh_loop())
         asyncio.create_task(self._market_analysis_loop())
@@ -747,22 +826,34 @@ class ProScalperEngine:
                 await self._refresh_broker_health()
             except Exception as exc:
                 self.runtime.broker_state = BrokerState.DISCONNECTED
+                self.runtime.rest_api_alive = False
+                self.runtime.last_error = str(exc)
                 self.set_safe_mode(True, f"Session refresh failed: {exc}")
 
     async def _refresh_broker_health(self) -> None:
         ok, profile, latency_ms = await asyncio.to_thread(self.client.validate_session)
         self.runtime.api_latency_ms = latency_ms
         if not ok:
+            self.runtime.rest_api_alive = False
             self.runtime.broker_state = BrokerState.DISCONNECTED
             self.runtime.websocket_alive = False
+            self.runtime.last_error = str(profile.get("error", "Broker validation failed"))
             self.set_safe_mode(True, f"Broker validation failed: {profile.get('error')}")
             return
-        self.runtime.broker_state = (
-            BrokerState.DEGRADED if latency_ms > self.risk.max_latency_ms else BrokerState.CONNECTED
-        )
-        if self.runtime.broker_state == BrokerState.DEGRADED:
+
+        self.runtime.rest_api_alive = True
+        self.runtime.last_rest_success_ts = time.time()
+        self.runtime.last_error = ""
+        self.broker_diagnostics["last_profile"] = profile.get("data", {})
+
+        if latency_ms > self.risk.max_latency_ms:
+            self.runtime.broker_state = BrokerState.DEGRADED
             self.set_safe_mode(True, f"High API latency detected: {latency_ms:.1f} ms")
+        elif not self.runtime.websocket_alive:
+            self.runtime.broker_state = BrokerState.DEGRADED
+            self.set_safe_mode(True, "REST connected, waiting for websocket market stream")
         else:
+            self.runtime.broker_state = BrokerState.CONNECTED
             self.runtime.safe_mode = False
             self.runtime.broker_reason = "Healthy"
             if not self.runtime.auto_trading_enabled:
@@ -799,6 +890,10 @@ class ProScalperEngine:
                 async with websockets.connect(ws_uri, ping_interval=10, ping_timeout=10, max_size=2**24) as ws:
                     self.runtime.websocket_alive = True
                     self.runtime.last_ws_message_ts = time.time()
+                    if self.runtime.rest_api_alive and self.runtime.api_latency_ms <= self.risk.max_latency_ms:
+                        self.runtime.broker_state = BrokerState.CONNECTED
+                        self.runtime.safe_mode = False
+                        self.runtime.broker_reason = "Healthy"
                     logger.info("Connected to Upstox MarketDataStreamerV3 endpoint.")
                     spot_keys = [v["spot_key"] for v in self.symbol_map.values()]
                     subscribe_payload = {
@@ -817,8 +912,9 @@ class ProScalperEngine:
                         started = time.time()
             except Exception as exc:
                 self.runtime.websocket_alive = False
+                self.runtime.last_error = str(exc)
                 self.set_safe_mode(True, f"Market websocket disconnected: {exc}")
-                self.runtime.broker_state = BrokerState.DISCONNECTED
+                self.runtime.broker_state = BrokerState.DEGRADED if self.runtime.rest_api_alive else BrokerState.DISCONNECTED
                 await asyncio.sleep(3)
 
     def _consume_ws_message(self, msg: str) -> None:
@@ -841,9 +937,6 @@ class ProScalperEngine:
     async def _portfolio_refresh_loop(self) -> None:
         while True:
             try:
-                if self.runtime.broker_state == BrokerState.DISCONNECTED:
-                    await asyncio.sleep(2)
-                    continue
                 funds, positions, holdings, orders = await asyncio.gather(
                     asyncio.to_thread(self.client.get_funds_margin),
                     asyncio.to_thread(self.client.get_positions),
@@ -857,11 +950,21 @@ class ProScalperEngine:
                     "orders": orders.get("data", []),
                     "updated_at": time.time(),
                 }
+                self.runtime.rest_api_alive = True
+                self.runtime.last_rest_success_ts = time.time()
+                self.broker_diagnostics["last_portfolio_error"] = ""
                 await asyncio.sleep(3)
             except Exception as exc:
-                logger.warning("Portfolio refresh failed: %s", exc)
-                self.runtime.broker_state = BrokerState.DISCONNECTED
-                self.set_safe_mode(True, f"Portfolio endpoint failure: {exc}")
+                err = str(exc)
+                logger.warning("Portfolio refresh failed: %s", err)
+                self.broker_diagnostics["last_portfolio_error"] = err
+                self.runtime.last_error = err
+                if "401" in err or "Unauthorized" in err:
+                    self.runtime.rest_api_alive = False
+                    self.runtime.broker_state = BrokerState.DISCONNECTED
+                else:
+                    self.runtime.broker_state = BrokerState.DEGRADED if self.runtime.rest_api_alive else BrokerState.DISCONNECTED
+                self.set_safe_mode(True, f"Portfolio endpoint failure: {err}")
                 await asyncio.sleep(2)
 
     def _nearest_expiry(self, contracts_data: List[Dict[str, Any]]) -> Optional[str]:
@@ -880,8 +983,32 @@ class ProScalperEngine:
         valid = sorted(x for x in expiries if x >= today)
         return valid[0].isoformat() if valid else None
 
+    def _should_refresh_expiry(self, symbol: str, snapshot: MarketSnapshot) -> bool:
+        now = time.time()
+        if not snapshot.expiry_date:
+            return True
+        last_refresh = self.expiry_refresh_ts.get(symbol, 0.0)
+        if now - last_refresh > 300:
+            return True
+        try:
+            expiry_dt = datetime.strptime(snapshot.expiry_date, "%Y-%m-%d").date()
+            return expiry_dt < date.today()
+        except Exception:
+            return True
+
     def _extract_quote(self, quotes: Dict[str, Any], instrument_key: str) -> Dict[str, Any]:
         return quotes.get("data", {}).get(instrument_key, {})
+
+    def _quote_ltp(self, quote: Dict[str, Any]) -> Optional[float]:
+        if not isinstance(quote, dict):
+            return None
+        ltpc = quote.get("ltpc", {})
+        ltp = ltpc.get("ltp")
+        if ltp is not None:
+            return float(ltp)
+        ohlc = quote.get("ohlc", {})
+        close = ohlc.get("close")
+        return float(close) if close is not None else None
 
     def _extract_bid_ask(
         self,
@@ -1182,6 +1309,29 @@ class ProScalperEngine:
         expected_drive = float(np.clip((signal.get("features", {}).get("breakout_velocity", 0.0) * 1500), -100, 100))
         support = self.heatmaps.get(symbol, {}).get("support_resistance", {}).get("support")
         resistance = self.heatmaps.get(symbol, {}).get("support_resistance", {}).get("resistance")
+        heat = self.heatmaps.get(symbol, {})
+        strikes = heat.get("strikes", [])
+        atm = snapshot.atm_strike or (strikes[len(strikes) // 2] if strikes else None)
+        tomorrow_watchlist = []
+        for strike in strikes[:]:
+            if atm is None:
+                break
+            distance = abs(strike - atm)
+            if distance <= (50 if symbol == "NIFTY" else 200):
+                liq_idx = strikes.index(strike)
+                liq_score = float((heat.get("liquidity_walls_bid", [0])[liq_idx] if liq_idx < len(heat.get("liquidity_walls_bid", [])) else 0))
+                gamma_score = float((heat.get("gamma_walls", [0])[liq_idx] if liq_idx < len(heat.get("gamma_walls", [])) else 0))
+                tomorrow_watchlist.append({"strike": strike, "distance_from_atm": distance, "liquidity_score": liq_score, "gamma_score": gamma_score})
+        tomorrow_watchlist = sorted(tomorrow_watchlist, key=lambda x: (x["distance_from_atm"], -x["liquidity_score"], -x["gamma_score"]))[:6]
+
+        opening_bias = "BULLISH" if overnight_sentiment > 10 else "BEARISH" if overnight_sentiment < -10 else "NEUTRAL"
+        premarket_plan = {
+            "enabled": session == SessionState.PREMARKET,
+            "opening_bias": opening_bias,
+            "priority_strikes": [x.get("strike") for x in tomorrow_watchlist[:3]],
+            "execution_note": "Wait for spread tightening + liquidity sweep confirmation before entry",
+            "risk_note": "No auto execution unless LIVE session and websocket healthy",
+        }
 
         result = {
             "symbol": symbol,
@@ -1197,6 +1347,8 @@ class ProScalperEngine:
             },
             "support_resistance": {"support": support, "resistance": resistance},
             "expected_opening_drive": expected_drive,
+            "premarket_plan": premarket_plan,
+            "tomorrow_watchlist": tomorrow_watchlist,
             "regime": regime.value,
             "post_market_review": {
                 "realized_pnl": self.performance["realized_pnl"],
@@ -1238,20 +1390,27 @@ class ProScalperEngine:
                 session = self.session_state()
                 if self.runtime.broker_state == BrokerState.DISCONNECTED:
                     await self._refresh_broker_health()
+                if not self.runtime.rest_api_alive:
                     await asyncio.sleep(1)
                     continue
                 for symbol, cfg in self.symbol_map.items():
                     snapshot = self.snapshots[symbol]
-                    if not snapshot.expiry_date:
+                    if self._should_refresh_expiry(symbol, snapshot):
                         contracts = await asyncio.to_thread(self.client.get_option_contracts, cfg["spot_key"])
                         snapshot.expiry_date = self._nearest_expiry(contracts.get("data", []))
+                        self.expiry_refresh_ts[symbol] = time.time()
                         env_expiry = os.getenv(f"{symbol}_EXPIRY", "").strip()
                         if env_expiry:
                             snapshot.expiry_date = env_expiry
                     if not snapshot.expiry_date:
                         raise RuntimeError(f"{symbol} expiry unavailable from option contracts")
 
-                    chain_resp = await asyncio.to_thread(self.client.get_option_chain, cfg["spot_key"], snapshot.expiry_date)
+                    try:
+                        chain_resp = await asyncio.to_thread(self.client.get_option_chain, cfg["spot_key"], snapshot.expiry_date)
+                    except Exception:
+                        snapshot.expiry_date = None
+                        self.expiry_refresh_ts[symbol] = 0.0
+                        raise
                     chain = chain_resp.get("data", [])
                     if not chain:
                         raise RuntimeError(f"No option chain rows for {symbol}")
@@ -1267,10 +1426,14 @@ class ProScalperEngine:
                     quote_keys = [cfg["spot_key"], snapshot.call_instrument_key or "", snapshot.put_instrument_key or ""]
                     quotes = await asyncio.to_thread(self.client.get_market_quotes, quote_keys)
                     snapshot.quote_raw = quotes.get("data", {})
+                    spot_quote = self._extract_quote(quotes, cfg["spot_key"])
+                    spot_quote_ltp = self._quote_ltp(spot_quote)
+                    if spot_quote_ltp is not None:
+                        snapshot.spot_ltp = float(spot_quote_ltp)
                     call_quote = self._extract_quote(quotes, snapshot.call_instrument_key or "")
                     put_quote = self._extract_quote(quotes, snapshot.put_instrument_key or "")
-                    snapshot.call_ltp = float(call_quote.get("ltpc", {}).get("ltp", 0.0))
-                    snapshot.put_ltp = float(put_quote.get("ltpc", {}).get("ltp", 0.0))
+                    snapshot.call_ltp = float(self._quote_ltp(call_quote) or snapshot.call_ltp or 0.0)
+                    snapshot.put_ltp = float(self._quote_ltp(put_quote) or snapshot.put_ltp or 0.0)
                     b, a, bq, aq = self._extract_bid_ask(call_quote)
                     snapshot.call_bid = b
                     snapshot.call_ask = a
@@ -1367,17 +1530,145 @@ class ProScalperEngine:
                 self.session_intelligence["global"] = {
                     "session": session.value,
                     "gift": await self._gift_influence(),
+                    "cached_state_loaded": self.cached_state_loaded,
+                    "last_cached_state_ts": self.last_cached_state_ts,
                     "timestamp": time.time(),
                 }
+                self._update_advisory_state()
                 self.runtime.last_analysis_ts = time.time()
                 latest_snapshot_ts = max((x.updated_at for x in self.snapshots.values()), default=0.0)
                 self.runtime.stale_feed = (time.time() - latest_snapshot_ts) > self.risk.stale_data_seconds
             except Exception as exc:
-                logger.error("Market analysis loop error: %s", exc)
-                self.runtime.broker_state = BrokerState.DISCONNECTED
-                self.set_safe_mode(True, f"Analysis loop failed: {exc}")
+                err = str(exc)
+                logger.error("Market analysis loop error: %s", err)
+                self.broker_diagnostics["last_analysis_error"] = err
+                self.runtime.last_error = err
+                if "401" in err or "Unauthorized" in err:
+                    self.runtime.rest_api_alive = False
+                    self.runtime.broker_state = BrokerState.DISCONNECTED
+                else:
+                    self.runtime.broker_state = BrokerState.DEGRADED if self.runtime.rest_api_alive else BrokerState.DISCONNECTED
+                self.set_safe_mode(True, f"Analysis loop failed: {err}")
             elapsed = time.time() - started
             await asyncio.sleep(max(0.0, POLL_INTERVAL_SECONDS - elapsed))
+
+    def _suggest_trade(self, symbol: str) -> Dict[str, Any]:
+        signal = self.last_signal.get(symbol, {})
+        snapshot = self.snapshots[symbol]
+        features = signal.get("features", {})
+        ai_conf = float(signal.get("ai", {}).get("ai_confidence", 0.0))
+        tqs = float(signal.get("tqs", 0.0))
+
+        checks = {
+            "momentum": features.get("momentum_score", 0.0) > 0.12,
+            "delta_spike": features.get("delta_velocity", 0.0) > 0.0006,
+            "volume_expansion": features.get("volume_acceleration", 0.0) > 0.05,
+            "spread_tight": features.get("spread_quality", 0.0) > 0.38,
+            "vwap_align": features.get("vwap_alignment", 0.0) > 0,
+            "gamma_align": features.get("gamma_bias", 0.0) > -0.2,
+            "ai_threshold": ai_conf >= self.risk.ai_threshold,
+            "tqs_threshold": tqs >= self.risk.ai_threshold,
+        }
+        pass_count = sum(1 for v in checks.values() if v)
+        action = "BUY_CALL" if pass_count >= 7 else "WAIT"
+        suggested_qty = 0
+        if action == "BUY_CALL" and snapshot.call_ltp:
+            suggested_qty = self._trade_qty(symbol, snapshot.call_ltp)
+
+        return {
+            "symbol": symbol,
+            "action": action,
+            "pass_count": pass_count,
+            "checks": checks,
+            "tqs": tqs,
+            "ai_confidence": ai_conf,
+            "atm_strike": snapshot.atm_strike,
+            "call_ltp": snapshot.call_ltp,
+            "expected_move": float(signal.get("ai", {}).get("expected_move", 0.0)),
+            "suggested_quantity": suggested_qty,
+            "timestamp": time.time(),
+        }
+
+    def _compute_advisory_backtest(self) -> Dict[str, Any]:
+        recent = self.db.recent_ticks(limit=1200)
+        by_symbol = {"NIFTY": [], "SENSEX": []}
+        for row in recent:
+            sym = row.get("symbol")
+            if sym in by_symbol and row.get("call_ltp") is not None and row.get("tqs") is not None:
+                by_symbol[sym].append(row)
+
+        summary: Dict[str, Any] = {"window_ticks": len(recent), "symbols": {}}
+        for symbol, rows in by_symbol.items():
+            rows = sorted(rows, key=lambda x: float(x.get("ts") or 0.0))
+            if len(rows) < 20:
+                summary["symbols"][symbol] = {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "avg_move": 0.0}
+                continue
+
+            trades = 0
+            wins = 0
+            losses = 0
+            moves: List[float] = []
+            threshold = float(self.risk.ai_threshold)
+            for i in range(len(rows) - 6):
+                entry = rows[i]
+                entry_tqs = float(entry.get("tqs") or 0.0)
+                entry_px = float(entry.get("call_ltp") or 0.0)
+                if entry_tqs < threshold or entry_px <= 0:
+                    continue
+                future = rows[i + 1 : i + 6]
+                if not future:
+                    continue
+                max_move = max(float(x.get("call_ltp") or entry_px) - entry_px for x in future)
+                min_move = min(float(x.get("call_ltp") or entry_px) - entry_px for x in future)
+                trades += 1
+                moves.append(max_move)
+                if max_move >= 5.0:
+                    wins += 1
+                elif min_move <= -3.0:
+                    losses += 1
+            win_rate = (wins / trades * 100.0) if trades else 0.0
+            avg_move = float(np.mean(moves)) if moves else 0.0
+            summary["symbols"][symbol] = {
+                "trades": trades,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": win_rate,
+                "avg_move": avg_move,
+            }
+        summary["updated_at"] = time.time()
+        return summary
+
+    def _update_advisory_state(self) -> None:
+        session = self.session_state()
+        live_data_available = self.runtime.rest_api_alive and self.runtime.websocket_alive
+        if session == SessionState.LIVE and live_data_available and not self.runtime.auto_trading_enabled:
+            suggestions = [self._suggest_trade(symbol) for symbol in ["NIFTY", "SENSEX"]]
+            if time.time() - self.last_advisory_backtest_ts > 20:
+                self.advisory_state["backtest"] = self._compute_advisory_backtest()
+                self.last_advisory_backtest_ts = time.time()
+            self.advisory_state.update(
+                {
+                    "mode": "ADVISORY_BACKTEST",
+                    "suggestions": suggestions,
+                    "updated_at": time.time(),
+                }
+            )
+        elif self.runtime.auto_trading_enabled and not self.runtime.safe_mode:
+            self.advisory_state.update(
+                {
+                    "mode": "AUTO_EXECUTION",
+                    "suggestions": [],
+                    "updated_at": time.time(),
+                }
+            )
+        else:
+            self.advisory_state.update(
+                {
+                    "mode": "MONITORING",
+                    "suggestions": [],
+                    "updated_at": time.time(),
+                }
+            )
 
     def _portfolio_exposure_pct(self) -> float:
         exposure = sum(trade.entry_price * trade.quantity for trade in self.active_trades.values())
@@ -1409,6 +1700,8 @@ class ProScalperEngine:
             return False, "MARKET_NOT_LIVE"
         if self.runtime.broker_state != BrokerState.CONNECTED:
             return False, "BROKER_NOT_HEALTHY"
+        if not self.runtime.websocket_alive:
+            return False, "WEBSOCKET_UNAVAILABLE"
         if self.runtime.api_latency_ms > self.risk.max_latency_ms:
             return False, "LATENCY_THRESHOLD_BREACHED"
         if self.runtime.stale_feed:
@@ -1654,6 +1947,9 @@ class ProScalperEngine:
                 if self.runtime.safe_mode:
                     await asyncio.sleep(1)
                     continue
+                if not self.runtime.auto_trading_enabled:
+                    await asyncio.sleep(1)
+                    continue
                 for symbol in ["NIFTY", "SENSEX"]:
                     open_for_symbol = [t for t in self.active_trades.values() if t.symbol == symbol]
                     if len(open_for_symbol) >= 2:
@@ -1737,9 +2033,12 @@ class ProScalperEngine:
                 "broker_state": self.runtime.broker_state.value,
                 "broker_reason": self.runtime.broker_reason,
                 "websocket_alive": self.runtime.websocket_alive,
+                "rest_api_alive": self.runtime.rest_api_alive,
                 "stale_feed": self.runtime.stale_feed,
                 "api_latency_ms": self.runtime.api_latency_ms,
                 "websocket_latency_ms": self.runtime.websocket_latency_ms,
+                "last_rest_success_ts": self.runtime.last_rest_success_ts,
+                "last_error": self.runtime.last_error,
             },
             "risk_config": self.risk.__dict__,
             "portfolio": self.portfolio_cache,
@@ -1758,6 +2057,9 @@ class ProScalperEngine:
             "recent_trades": [x.__dict__ for x in list(self.closed_trades)[-40:]],
             "heatmaps": self.heatmaps,
             "backtesting": self._backtesting_snapshot(),
+            "advisory": self.advisory_state,
+            "cache": {"loaded": self.cached_state_loaded, "last_cached_ts": self.last_cached_state_ts},
+            "broker_diagnostics": self.broker_diagnostics,
         }
 
     async def _broadcast_loop(self) -> None:
@@ -1803,6 +2105,27 @@ class ProScalperEngine:
             self.last_signal[symbol].setdefault("features", {})["breakout_velocity"] = 0.02
         qty = payload.quantity_lots * self.symbol_map[symbol]["lot_size"]
         return await self._place_entry(symbol, force=payload.force, quantity_override=qty)
+
+    async def emergency_stop(self, exit_open_positions: bool = True) -> Dict[str, Any]:
+        self.runtime.auto_trading_enabled = False
+        self.set_safe_mode(True, "Manual STOP by operator")
+        exited_trades = 0
+        errors: List[str] = []
+        if exit_open_positions:
+            for trade in list(self.active_trades.values()):
+                try:
+                    await self._place_exit(trade, "MANUAL_EMERGENCY_STOP")
+                    exited_trades += 1
+                except Exception as exc:
+                    errors.append(str(exc))
+        return {
+            "auto_trading_enabled": self.runtime.auto_trading_enabled,
+            "safe_mode": self.runtime.safe_mode,
+            "reason": self.runtime.broker_reason,
+            "exited_trades": exited_trades,
+            "remaining_active_trades": len(self.active_trades),
+            "errors": errors,
+        }
 
 
 engine = ProScalperEngine()
@@ -1858,6 +2181,22 @@ async def set_trading(enabled: bool) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Cannot enable trading while SAFE MODE is active.")
     engine.runtime.auto_trading_enabled = enabled
     return {"auto_trading_enabled": engine.runtime.auto_trading_enabled}
+
+
+@app.post("/api/trading/stop")
+async def emergency_stop(exit_open_positions: bool = True) -> Dict[str, Any]:
+    return await engine.emergency_stop(exit_open_positions=exit_open_positions)
+
+
+@app.get("/api/broker/status")
+async def broker_status() -> Dict[str, Any]:
+    payload = engine._dashboard_payload()
+    return {
+        "runtime": payload.get("runtime", {}),
+        "portfolio_last_updated": payload.get("portfolio", {}).get("updated_at"),
+        "funds_snapshot": payload.get("portfolio", {}).get("funds", {}),
+        "broker_diagnostics": payload.get("broker_diagnostics", {}),
+    }
 
 
 @app.websocket("/ws/dashboard")

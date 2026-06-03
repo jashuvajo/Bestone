@@ -15,8 +15,8 @@ buildSync({
   format: "esm",
   outfile: "dist/assets/app.js",
   define: {
-    "import.meta.env.VITE_API_URL": JSON.stringify(process.env.VITE_API_URL || "http://localhost:8000"),
-    "import.meta.env.VITE_WS_URL": JSON.stringify(process.env.VITE_WS_URL || "ws://localhost:8000/ws/dashboard"),
+    "import.meta.env.VITE_API_URL": JSON.stringify(process.env.VITE_API_URL || ""),
+    "import.meta.env.VITE_WS_URL": JSON.stringify(process.env.VITE_WS_URL || ""),
   },
 });
 

@@ -13,10 +13,10 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { createChart } from "lightweight-charts";
+import { AreaSeries, createChart } from "lightweight-charts";
 
-const WS_URL = import.meta.env.VITE_WS_URL || "ws://localhost:8000/ws/dashboard";
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const WS_URL = import.meta.env.VITE_WS_URL || "";
+const API_URL = import.meta.env.VITE_API_URL || "";
 
 const moduleLabels = [
   "Execution HUD",
@@ -82,29 +82,41 @@ function Stat({ label, value, danger = false }) {
 function useLwChart(containerRef, history) {
   useEffect(() => {
     if (!containerRef.current) return;
-    const chart = createChart(containerRef.current, {
-      width: containerRef.current.clientWidth,
-      height: 240,
-      layout: { background: { color: "#020617" }, textColor: "#94a3b8" },
-      rightPriceScale: { borderColor: "#334155" },
-      timeScale: { borderColor: "#334155", timeVisible: true, secondsVisible: true },
-      grid: { vertLines: { color: "#0f172a" }, horzLines: { color: "#0f172a" } },
-    });
-    const series = chart.addAreaSeries({
-      lineColor: "#06b6d4",
-      topColor: "rgba(6,182,212,0.25)",
-      bottomColor: "rgba(6,182,212,0.0)",
-      lineWidth: 2,
-    });
-    series.setData(history);
+    let chart;
+    let series;
+    try {
+      chart = createChart(containerRef.current, {
+        width: containerRef.current.clientWidth,
+        height: 240,
+        layout: { background: { color: "#020617" }, textColor: "#94a3b8" },
+        rightPriceScale: { borderColor: "#334155" },
+        timeScale: { borderColor: "#334155", timeVisible: true, secondsVisible: true },
+        grid: { vertLines: { color: "#0f172a" }, horzLines: { color: "#0f172a" } },
+      });
+      const areaOptions = {
+        lineColor: "#06b6d4",
+        topColor: "rgba(6,182,212,0.25)",
+        bottomColor: "rgba(6,182,212,0.0)",
+        lineWidth: 2,
+      };
+      series =
+        typeof chart.addAreaSeries === "function"
+          ? chart.addAreaSeries(areaOptions)
+          : chart.addSeries(AreaSeries, areaOptions);
+      series.setData(history);
+    } catch (error) {
+      console.error("Lightweight chart init failed", error);
+      return;
+    }
+
     const resize = () => {
-      if (!containerRef.current) return;
+      if (!containerRef.current || !chart) return;
       chart.applyOptions({ width: containerRef.current.clientWidth });
     };
     window.addEventListener("resize", resize);
     return () => {
       window.removeEventListener("resize", resize);
-      chart.remove();
+      if (chart) chart.remove();
     };
   }, [containerRef, history]);
 }
@@ -136,14 +148,47 @@ export default function App() {
   const perf = payload.performance || {};
   const runtime = payload.runtime || {};
   const sessionIntel = payload.session_intelligence?.[selectedSymbol] || {};
+  const formatTs = (ts) => (ts ? new Date(ts * 1000).toLocaleString() : "NA");
+  const tomorrowWatchlist = sessionIntel.tomorrow_watchlist || [];
+  const premarketPlan = sessionIntel.premarket_plan || {};
+  const cacheMeta = payload.cache || {};
+
+  const resolvedWsUrl = useMemo(() => {
+    if (WS_URL) return WS_URL;
+    if (!API_URL) return "";
+    try {
+      const u = new URL(API_URL);
+      u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
+      u.pathname = "/ws/dashboard";
+      u.search = "";
+      u.hash = "";
+      return u.toString();
+    } catch {
+      return "";
+    }
+  }, []);
+
+  const missingEndpointConfig = !API_URL && !resolvedWsUrl;
 
   useLwChart(chartRef, priceSeries);
 
   useEffect(() => {
     let ws;
     let alive = true;
+
+    if (!resolvedWsUrl) {
+      setConnected(false);
+      return () => {};
+    }
+
     const connect = () => {
-      ws = new WebSocket(WS_URL);
+      try {
+        ws = new WebSocket(resolvedWsUrl);
+      } catch (error) {
+        console.error("WebSocket init failed", error);
+        setConnected(false);
+        return;
+      }
       ws.onopen = () => setConnected(true);
       ws.onclose = () => {
         setConnected(false);
@@ -169,7 +214,7 @@ export default function App() {
       alive = false;
       if (ws) ws.close();
     };
-  }, [selectedSymbol]);
+  }, [selectedSymbol, resolvedWsUrl]);
 
   const sessionBadge = useMemo(() => {
     const m = {
@@ -246,13 +291,22 @@ export default function App() {
 
   const backtestRows = payload.backtesting?.recent_replay || [];
   const replayPoint = backtestRows[replayCursor] || {};
+  const advisory = payload.advisory || {};
+  const advisorySuggestions = advisory.suggestions || [];
+  const advisoryBacktest = advisory.backtest || {};
 
   const postConfig = async (body) => {
+    if (!API_URL) return;
     await fetch(`${API_URL}/api/config`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+  };
+
+  const stopAutoTrading = async () => {
+    if (!API_URL) return;
+    await fetch(`${API_URL}/api/trading/stop`, { method: "POST" });
   };
 
   return (
@@ -279,6 +333,18 @@ export default function App() {
           </div>
         </motion.div>
 
+        {missingEndpointConfig && (
+          <div className="mb-3 rounded-lg border border-amber-700 bg-amber-900/30 px-3 py-2 text-sm text-amber-200">
+            Frontend endpoint variables are missing. Set <span className="font-semibold">VITE_API_URL</span> and <span className="font-semibold">VITE_WS_URL</span> in Vercel and redeploy.
+          </div>
+        )}
+
+        {cacheMeta.loaded && !runtime.rest_api_alive && (
+          <div className="mb-3 rounded-lg border border-cyan-700 bg-cyan-900/20 px-3 py-2 text-sm text-cyan-200">
+            Showing cached last-known market data from <span className="font-semibold">{formatTs(cacheMeta.last_cached_ts || 0)}</span> while waiting for Upstox REST reconnect.
+          </div>
+        )}
+
         {runtime.safe_mode && (
           <div className="mb-3 rounded-lg border border-rose-700 bg-rose-900/30 px-3 py-2 text-sm text-rose-200">
             Broker disconnected or protections triggered. Auto trading is blocked. Reason: <span className="font-semibold">{runtime.broker_reason}</span>
@@ -300,6 +366,12 @@ export default function App() {
               <div className="mt-2 flex flex-col gap-2 text-xs">
                 <button className="rounded bg-emerald-700/70 px-2 py-1" onClick={() => fetch(`${API_URL}/api/trading/true`, { method: "POST" })}>Enable Auto</button>
                 <button className="rounded bg-rose-700/70 px-2 py-1" onClick={() => fetch(`${API_URL}/api/trading/false`, { method: "POST" })}>Disable Auto</button>
+                <button
+                  className="rounded bg-red-700/90 px-2 py-1 font-semibold"
+                  onClick={stopAutoTrading}
+                >
+                  STOP AUTO TRADING
+                </button>
                 <button
                   className="rounded bg-cyan-700/70 px-2 py-1"
                   onClick={() =>
@@ -400,6 +472,8 @@ export default function App() {
                   <Stat label="Positions" value={payload.portfolio?.positions?.length || 0} />
                   <Stat label="Orders" value={payload.portfolio?.orders?.length || 0} />
                   <Stat label="Broker Status" value={runtime.broker_state || "NA"} danger={runtime.broker_state !== "CONNECTED"} />
+                  <Stat label="REST API" value={runtime.rest_api_alive ? "CONNECTED" : "DISCONNECTED"} danger={!runtime.rest_api_alive} />
+                  <Stat label="Funds Updated" value={formatTs(payload.portfolio?.updated_at || 0)} />
                   <Stat label="Exposure %" value={`${(Number(perf.exposure_pct || 0) * 100).toFixed(1)}%`} />
                 </div>
               </div>
@@ -430,9 +504,12 @@ export default function App() {
                 </div>
                 <div className="mt-2 grid grid-cols-2 gap-1 text-xs">
                   <div>Broker: {runtime.broker_state}</div>
+                  <div>REST Alive: {String(runtime.rest_api_alive)}</div>
                   <div>WS Alive: {String(runtime.websocket_alive)}</div>
                   <div>Stale Feed: {String(runtime.stale_feed)}</div>
                   <div>Fill Drift: {Number(perf.fill_drift || 0).toFixed(2)}</div>
+                  <div>Last REST: {formatTs(runtime.last_rest_success_ts || 0)}</div>
+                  <div className="col-span-2 truncate">Error: {runtime.last_error || "none"}</div>
                 </div>
               </div>
             </section>
@@ -473,6 +550,7 @@ export default function App() {
 
               <div className={panelClass}>
                 <div className={tiny}>Strategy Router</div>
+                <div className="mt-2 text-xs text-cyan-300">Mode: {advisory.mode || "MONITORING"}</div>
                 <div className="mt-2 space-y-1 text-xs">
                   {routeChecks.map((r) => (
                     <div key={r.k} className={`flex justify-between rounded px-2 py-1 ${r.pass ? "bg-emerald-900/30 text-emerald-300" : "bg-rose-900/30 text-rose-300"}`}>
@@ -481,6 +559,13 @@ export default function App() {
                   ))}
                 </div>
                 <div className="mt-2 text-xs">Cross-corr: {Number(perf.cross_symbol_correlation || 0).toFixed(3)}</div>
+                <div className="mt-2 space-y-1 text-xs">
+                  {advisorySuggestions.slice(0, 2).map((s) => (
+                    <div key={`${s.symbol}-${s.timestamp}`} className="rounded bg-slate-950/70 px-2 py-1">
+                      {s.symbol}: <span className={s.action === "BUY_CALL" ? "text-emerald-300" : "text-amber-300"}>{s.action}</span> | TQS {Number(s.tqs || 0).toFixed(1)}
+                    </div>
+                  ))}
+                </div>
               </div>
 
               <div className={panelClass}>
@@ -521,6 +606,19 @@ export default function App() {
                   <div>Gap vs Prev Close: {Number(sessionIntel.gap_pct_vs_prev_close || 0).toFixed(2)}%</div>
                   <div>Expected Drive: {Number(sessionIntel.expected_opening_drive || 0).toFixed(2)}</div>
                   <div>GIFT Change: {Number(payload.session_intelligence?.global?.gift?.change_pct || 0).toFixed(2)}%</div>
+                  <div>Premarket Enabled: {String(premarketPlan.enabled || false)}</div>
+                  <div>Opening Bias: {premarketPlan.opening_bias || "NA"}</div>
+                  <div className="text-slate-400">{premarketPlan.execution_note || ""}</div>
+                  <div className="mt-2 text-cyan-300">Tomorrow Watchlist:</div>
+                  {tomorrowWatchlist.length === 0 ? (
+                    <div className="text-slate-400">No candidates yet</div>
+                  ) : (
+                    tomorrowWatchlist.slice(0, 4).map((w) => (
+                      <div key={`${selectedSymbol}-${w.strike}`} className="rounded bg-slate-950/70 px-2 py-1">
+                        {w.strike} | dATM {Number(w.distance_from_atm || 0).toFixed(0)} | liq {Number(w.liquidity_score || 0).toFixed(0)}
+                      </div>
+                    ))
+                  )}
                 </div>
               </div>
 
@@ -528,6 +626,12 @@ export default function App() {
                 <div className={tiny}>Backtesting</div>
                 <div className="mt-2 space-y-2 text-xs">
                   <div>Stored ticks: {payload.backtesting?.total_records || 0}</div>
+                  <div>Advisory updated: {formatTs(advisory.updated_at || 0)}</div>
+                  <div className="rounded bg-slate-950/70 p-2">
+                    <div>NIFTY win rate: {Number(advisoryBacktest.symbols?.NIFTY?.win_rate || 0).toFixed(1)}%</div>
+                    <div>SENSEX win rate: {Number(advisoryBacktest.symbols?.SENSEX?.win_rate || 0).toFixed(1)}%</div>
+                    <div>Total window ticks: {Number(advisoryBacktest.window_ticks || 0)}</div>
+                  </div>
                   <div className="flex items-center gap-2">
                     <button className="rounded bg-slate-800 px-2 py-1" onClick={() => setReplayCursor((v) => Math.max(v - 1, 0))}>Prev</button>
                     <button className="rounded bg-slate-800 px-2 py-1" onClick={() => setReplayCursor((v) => Math.min(v + 1, Math.max(backtestRows.length - 1, 0)))}>Next</button>
