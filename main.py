@@ -1625,44 +1625,120 @@ class ProScalperEngine:
             if sym in by_symbol and row.get("call_ltp") is not None and row.get("tqs") is not None:
                 by_symbol[sym].append(row)
 
-        summary: Dict[str, Any] = {"window_ticks": len(recent), "symbols": {}}
+        target_points = 5.0
+        stop_points = 3.0
+        summary: Dict[str, Any] = {
+            "window_ticks": len(recent),
+            "trading_capital": float(self.risk.trading_capital),
+            "capital_allocation_pct": float(self.risk.capital_allocation_pct),
+            "aggression_level": float(self.risk.aggression_level),
+            "target_points": target_points,
+            "stop_points": stop_points,
+            "symbols": {},
+            "totals": {
+                "evaluated_windows": 0,
+                "executed_signals": 0,
+                "failed_signals": 0,
+                "profit_signals": 0,
+                "loss_signals": 0,
+                "neutral_signals": 0,
+                "gross_points": 0.0,
+                "gross_pnl": 0.0,
+            },
+        }
+
         for symbol, rows in by_symbol.items():
             rows = sorted(rows, key=lambda x: float(x.get("ts") or 0.0))
             if len(rows) < 20:
-                summary["symbols"][symbol] = {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "avg_move": 0.0}
+                summary["symbols"][symbol] = {
+                    "evaluated_windows": 0,
+                    "executed_signals": 0,
+                    "failed_signals": 0,
+                    "profit_signals": 0,
+                    "loss_signals": 0,
+                    "neutral_signals": 0,
+                    "win_rate": 0.0,
+                    "avg_move": 0.0,
+                    "avg_quantity": 0.0,
+                    "gross_points": 0.0,
+                    "gross_pnl": 0.0,
+                }
                 continue
 
-            trades = 0
-            wins = 0
-            losses = 0
+            evaluated_windows = 0
+            executed_signals = 0
+            failed_signals = 0
+            profit_signals = 0
+            loss_signals = 0
+            neutral_signals = 0
             moves: List[float] = []
+            qty_samples: List[int] = []
+            gross_points = 0.0
+            gross_pnl = 0.0
             threshold = float(self.risk.ai_threshold)
+
             for i in range(len(rows) - 6):
                 entry = rows[i]
+                evaluated_windows += 1
                 entry_tqs = float(entry.get("tqs") or 0.0)
                 entry_px = float(entry.get("call_ltp") or 0.0)
                 if entry_tqs < threshold or entry_px <= 0:
+                    failed_signals += 1
                     continue
                 future = rows[i + 1 : i + 6]
                 if not future:
+                    failed_signals += 1
                     continue
+
                 max_move = max(float(x.get("call_ltp") or entry_px) - entry_px for x in future)
                 min_move = min(float(x.get("call_ltp") or entry_px) - entry_px for x in future)
-                trades += 1
+                terminal_move = float(future[-1].get("call_ltp") or entry_px) - entry_px
+
+                qty = self._trade_qty(symbol, entry_px)
+                executed_signals += 1
+                qty_samples.append(qty)
                 moves.append(max_move)
-                if max_move >= 5.0:
-                    wins += 1
-                elif min_move <= -3.0:
-                    losses += 1
-            win_rate = (wins / trades * 100.0) if trades else 0.0
+
+                if max_move >= target_points:
+                    realized_points = target_points
+                    profit_signals += 1
+                elif min_move <= -stop_points:
+                    realized_points = -stop_points
+                    loss_signals += 1
+                else:
+                    realized_points = terminal_move
+                    neutral_signals += 1
+
+                gross_points += realized_points
+                gross_pnl += realized_points * qty
+
+            win_rate = (profit_signals / executed_signals * 100.0) if executed_signals else 0.0
             avg_move = float(np.mean(moves)) if moves else 0.0
+            avg_quantity = float(np.mean(qty_samples)) if qty_samples else 0.0
             summary["symbols"][symbol] = {
-                "trades": trades,
-                "wins": wins,
-                "losses": losses,
+                "evaluated_windows": evaluated_windows,
+                "executed_signals": executed_signals,
+                "failed_signals": failed_signals,
+                "profit_signals": profit_signals,
+                "loss_signals": loss_signals,
+                "neutral_signals": neutral_signals,
                 "win_rate": win_rate,
                 "avg_move": avg_move,
+                "avg_quantity": avg_quantity,
+                "gross_points": gross_points,
+                "gross_pnl": gross_pnl,
             }
+
+            totals = summary["totals"]
+            totals["evaluated_windows"] += evaluated_windows
+            totals["executed_signals"] += executed_signals
+            totals["failed_signals"] += failed_signals
+            totals["profit_signals"] += profit_signals
+            totals["loss_signals"] += loss_signals
+            totals["neutral_signals"] += neutral_signals
+            totals["gross_points"] += gross_points
+            totals["gross_pnl"] += gross_pnl
+
         summary["updated_at"] = time.time()
         return summary
 

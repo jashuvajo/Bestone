@@ -85,6 +85,76 @@ function readCachedPayload() {
   }
 }
 
+const IST_OFFSET_MS = 19800000;
+const PREMARKET_START_SEC = 9 * 3600;
+const LIVE_START_SEC = 9 * 3600 + 15 * 60;
+const LIVE_END_SEC = 15 * 3600 + 30 * 60;
+const POST_END_SEC = 16 * 3600;
+
+function formatDuration(totalSeconds) {
+  const sec = Math.max(0, Math.floor(totalSeconds));
+  const h = String(Math.floor(sec / 3600)).padStart(2, "0");
+  const m = String(Math.floor((sec % 3600) / 60)).padStart(2, "0");
+  const s = String(sec % 60).padStart(2, "0");
+  return `${h}:${m}:${s}`;
+}
+
+function secondsUntilNextPremarket(nowMs) {
+  const istNow = new Date(nowMs + IST_OFFSET_MS);
+  const day = istNow.getUTCDay();
+  const secOfDay = istNow.getUTCHours() * 3600 + istNow.getUTCMinutes() * 60 + istNow.getUTCSeconds();
+  const isWeekend = day === 0 || day === 6;
+
+  let daysUntil = 0;
+  if (isWeekend) {
+    daysUntil = day === 6 ? 2 : 1;
+  } else if (secOfDay < PREMARKET_START_SEC) {
+    daysUntil = 0;
+  } else if (secOfDay >= POST_END_SEC) {
+    daysUntil = day === 5 ? 3 : 1;
+  } else {
+    return 0;
+  }
+
+  if (daysUntil === 0) {
+    return PREMARKET_START_SEC - secOfDay;
+  }
+  return (86400 - secOfDay) + PREMARKET_START_SEC + (daysUntil - 1) * 86400;
+}
+
+function buildMarketNotice(session, nowMs) {
+  const istNow = new Date(nowMs + IST_OFFSET_MS);
+  const secOfDay = istNow.getUTCHours() * 3600 + istNow.getUTCMinutes() * 60 + istNow.getUTCSeconds();
+  const nextPremarketSec = secondsUntilNextPremarket(nowMs);
+
+  if (session === "PREMARKET") {
+    return {
+      tone: "bg-amber-900/25 border-amber-700 text-amber-200",
+      title: "Premarket running",
+      detail: `Market opens in ${formatDuration(Math.max(0, LIVE_START_SEC - secOfDay))} (09:15 IST).`,
+    };
+  }
+  if (session === "LIVE") {
+    return {
+      tone: "bg-emerald-900/25 border-emerald-700 text-emerald-200",
+      title: "Market open",
+      detail: `Execution window active. Live session closes in ${formatDuration(Math.max(0, LIVE_END_SEC - secOfDay))}.`,
+    };
+  }
+  if (session === "POSTMARKET") {
+    return {
+      tone: "bg-violet-900/25 border-violet-700 text-violet-200",
+      title: "Post market running",
+      detail: `Execution blocked. Next premarket starts in ${formatDuration(nextPremarketSec)} (09:00 IST).`,
+    };
+  }
+  return {
+    tone: "bg-sky-900/25 border-sky-700 text-sky-200",
+    title: "Market closed",
+    detail: `Backtesting hub active for tomorrow. Next premarket in ${formatDuration(nextPremarketSec)} (09:00 IST).`,
+  };
+}
+
 function Stat({ label, value, danger = false }) {
   return (
     <div className="rounded-md bg-slate-950/70 px-2 py-1">
@@ -156,6 +226,7 @@ export default function App() {
     max_symbol_concentration_pct: 0.7,
   });
   const [replayCursor, setReplayCursor] = useState(0);
+  const [clockNowMs, setClockNowMs] = useState(Date.now());
   const chartRef = useRef(null);
 
   const snap = payload.snapshots?.[selectedSymbol] || {};
@@ -177,6 +248,21 @@ export default function App() {
     equityFunds.used_margin ?? equityFunds.utilised_debits ?? funds.used_margin ?? funds.utilised_debits ?? 0,
   );
   const snapshotUpdatedAt = Number(snap.updated_at || payload.timestamp || 0);
+  const istClock = useMemo(
+    () =>
+      new Intl.DateTimeFormat("en-IN", {
+        timeZone: "Asia/Kolkata",
+        weekday: "short",
+        day: "2-digit",
+        month: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      }).format(clockNowMs),
+    [clockNowMs],
+  );
+  const marketNotice = useMemo(() => buildMarketNotice(payload.session, clockNowMs), [payload.session, clockNowMs]);
 
   const resolvedWsUrl = useMemo(() => {
     if (WS_URL) return WS_URL;
@@ -196,6 +282,11 @@ export default function App() {
   const missingEndpointConfig = !API_URL && !resolvedWsUrl;
 
   useLwChart(chartRef, priceSeries);
+
+  useEffect(() => {
+    const timer = setInterval(() => setClockNowMs(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     let ws;
@@ -248,6 +339,23 @@ export default function App() {
       if (ws) ws.close();
     };
   }, [selectedSymbol, resolvedWsUrl]);
+
+  useEffect(() => {
+    const cfg = payload.risk_config || {};
+    if (!Object.keys(cfg).length) return;
+    setRiskEdit((prev) => ({
+      ...prev,
+      trading_capital: Number(cfg.trading_capital ?? prev.trading_capital),
+      max_exposure_pct: Number(cfg.max_exposure_pct ?? prev.max_exposure_pct),
+      ai_threshold: Number(cfg.ai_threshold ?? prev.ai_threshold),
+      aggression_level: Number(cfg.aggression_level ?? prev.aggression_level),
+    }));
+  }, [
+    payload.risk_config?.trading_capital,
+    payload.risk_config?.max_exposure_pct,
+    payload.risk_config?.ai_threshold,
+    payload.risk_config?.aggression_level,
+  ]);
 
   const sessionBadge = useMemo(() => {
     const m = {
@@ -355,6 +463,7 @@ export default function App() {
             <div>
               <div className="text-xl font-bold tracking-wide">PRO SCALPER</div>
               <div className="text-xs text-slate-400">Institutional AI Options Scalping Terminal · NIFTY / SENSEX</div>
+              <div className="text-[11px] text-cyan-300">IST: {istClock}</div>
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -371,6 +480,10 @@ export default function App() {
             Frontend endpoint variables are missing. Set <span className="font-semibold">VITE_API_URL</span> and <span className="font-semibold">VITE_WS_URL</span> in Vercel and redeploy.
           </div>
         )}
+
+        <div className={`mb-3 rounded-lg border px-3 py-2 text-sm ${marketNotice.tone}`}>
+          <span className="font-semibold">{marketNotice.title}:</span> {marketNotice.detail}
+        </div>
 
         {cacheMeta.loaded && !runtime.rest_api_alive && (
           <div className="mb-3 rounded-lg border border-cyan-700 bg-cyan-900/20 px-3 py-2 text-sm text-cyan-200">
@@ -527,6 +640,7 @@ export default function App() {
                   <label className="flex items-center justify-between"><span>AI Threshold</span><input className="w-32 rounded bg-slate-950 px-2 py-1" type="number" value={riskEdit.ai_threshold} onChange={(e) => setRiskEdit((x) => ({ ...x, ai_threshold: Number(e.target.value) }))} /></label>
                   <label className="flex items-center justify-between"><span>Aggression</span><input className="w-32 rounded bg-slate-950 px-2 py-1" type="number" step="0.1" value={riskEdit.aggression_level} onChange={(e) => setRiskEdit((x) => ({ ...x, aggression_level: Number(e.target.value) }))} /></label>
                   <button className="w-full rounded bg-cyan-700/70 py-1" onClick={() => postConfig(riskEdit)}>Save Risk Config</button>
+                  <div className="text-slate-400">Trading Capital is used by live execution, auto trading, and advisory backtesting sizing.</div>
                 </div>
               </div>
 
@@ -665,11 +779,26 @@ export default function App() {
               </div>
 
               <div className={panelClass}>
-                <div className={tiny}>Backtesting</div>
+                <div className={tiny}>Backtesting Hub</div>
                 <div className="mt-2 space-y-2 text-xs">
                   <div>Stored ticks: {payload.backtesting?.total_records || 0}</div>
                   <div>Advisory updated: {formatTs(advisory.updated_at || 0)}</div>
+                  <div>Capital for simulation: ₹{Number(advisoryBacktest.trading_capital || riskEdit.trading_capital || 0).toFixed(0)}</div>
+                  <div className="rounded bg-slate-950/70 p-2 space-y-1">
+                    <div className="text-cyan-300">Signal Outcomes (All Symbols)</div>
+                    <div>Executed: {Number(advisoryBacktest.totals?.executed_signals || 0)}</div>
+                    <div>Failed: {Number(advisoryBacktest.totals?.failed_signals || 0)}</div>
+                    <div>Profit: {Number(advisoryBacktest.totals?.profit_signals || 0)}</div>
+                    <div>Loss: {Number(advisoryBacktest.totals?.loss_signals || 0)}</div>
+                    <div>Neutral: {Number(advisoryBacktest.totals?.neutral_signals || 0)}</div>
+                    <div>Gross Points: {Number(advisoryBacktest.totals?.gross_points || 0).toFixed(2)}</div>
+                    <div className={Number(advisoryBacktest.totals?.gross_pnl || 0) >= 0 ? "text-emerald-300" : "text-rose-300"}>
+                      Est. PnL: ₹{Number(advisoryBacktest.totals?.gross_pnl || 0).toFixed(2)}
+                    </div>
+                  </div>
                   <div className="rounded bg-slate-950/70 p-2">
+                    <div>NIFTY exec/fail: {Number(advisoryBacktest.symbols?.NIFTY?.executed_signals || 0)} / {Number(advisoryBacktest.symbols?.NIFTY?.failed_signals || 0)}</div>
+                    <div>SENSEX exec/fail: {Number(advisoryBacktest.symbols?.SENSEX?.executed_signals || 0)} / {Number(advisoryBacktest.symbols?.SENSEX?.failed_signals || 0)}</div>
                     <div>NIFTY win rate: {Number(advisoryBacktest.symbols?.NIFTY?.win_rate || 0).toFixed(1)}%</div>
                     <div>SENSEX win rate: {Number(advisoryBacktest.symbols?.SENSEX?.win_rate || 0).toFixed(1)}%</div>
                     <div>Total window ticks: {Number(advisoryBacktest.window_ticks || 0)}</div>
