@@ -150,6 +150,7 @@ class TradeRecord:
     ai_confidence: float
     regime: str
     trailing_state: str = "INIT"
+    partial_exit_done: bool = False
     exit_price: Optional[float] = None
     exit_ts: Optional[float] = None
     exit_reason: Optional[str] = None
@@ -547,10 +548,12 @@ class ModelEngine:
             "momentum_score",
             "delta_velocity",
             "aggressive_delta",
+            "cumulative_delta_strength",
             "volume_acceleration",
             "spread_quality",
             "gamma_bias",
             "iv_expansion",
+            "realized_volatility",
             "vwap_alignment",
             "option_chain_bias",
             "market_profile_alignment",
@@ -667,6 +670,7 @@ class ProScalperEngine:
                 "call": deque(maxlen=500),
                 "volume_proxy": deque(maxlen=500),
                 "imbalance": deque(maxlen=500),
+                "cum_delta": deque(maxlen=500),
                 "spread": deque(maxlen=500),
             }
         )
@@ -732,6 +736,18 @@ class ProScalperEngine:
         asyncio.create_task(self._execution_loop())
         asyncio.create_task(self._broadcast_loop())
         asyncio.create_task(self._telemetry_loop())
+        asyncio.create_task(self._session_refresh_loop())
+
+    async def _session_refresh_loop(self) -> None:
+        interval = max(60, int(os.getenv("UPSTOX_SESSION_REFRESH_SECONDS", "600")))
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await asyncio.to_thread(self.client.authenticate, True)
+                await self._refresh_broker_health()
+            except Exception as exc:
+                self.runtime.broker_state = BrokerState.DISCONNECTED
+                self.set_safe_mode(True, f"Session refresh failed: {exc}")
 
     async def _refresh_broker_health(self) -> None:
         ok, profile, latency_ms = await asyncio.to_thread(self.client.validate_session)
@@ -1007,6 +1023,14 @@ class ProScalperEngine:
             return float(p[-1])
         return float(np.dot(p, v) / v.sum())
 
+    def _realized_volatility(self, symbol: str, window: int = 30) -> float:
+        spot = list(self.series[symbol]["spot"])[-window:]
+        if len(spot) < 5:
+            return 0.0
+        arr = np.array(spot, dtype=np.float64)
+        returns = np.diff(arr) / np.maximum(arr[:-1], 1e-9)
+        return float(np.std(returns) * np.sqrt(max(len(returns), 1)))
+
     def _microstructure(self, symbol: str, snapshot: MarketSnapshot) -> Dict[str, float]:
         s = self.series[symbol]
         spread = 0.0
@@ -1072,9 +1096,16 @@ class ProScalperEngine:
             if len(s["volume_proxy"]) > 20
             else 0.0
         )
+        cumulative_delta_series = list(s["cum_delta"])
+        cumulative_delta_strength = float(
+            np.clip((cumulative_delta_series[-1] - cumulative_delta_series[-8]) / 5000.0, -1.0, 1.0)
+            if len(cumulative_delta_series) >= 8
+            else 0.0
+        )
         spread_quality = float(np.clip(1.0 - (micro["spread"] / 2.0), 0.0, 1.0))
         gamma_bias = float(np.clip((snapshot.gamma_wall or 0.0) / 100000.0, -1.0, 1.0))
         iv_expansion = float(np.clip(snapshot.iv / 100.0, 0.0, 2.0))
+        realized_volatility = float(np.clip(self._realized_volatility(symbol) * 100.0, 0.0, 5.0))
         vwap_val = self._vwap(s["call"], s["volume_proxy"])
         vwap_alignment = 1.0 if call[-1] > vwap_val else -0.6
         option_chain_bias = float(
@@ -1097,10 +1128,12 @@ class ProScalperEngine:
             "momentum_score": momentum_score,
             "delta_velocity": delta_velocity,
             "aggressive_delta": aggressive_delta,
+            "cumulative_delta_strength": cumulative_delta_strength,
             "volume_acceleration": volume_acceleration,
             "spread_quality": spread_quality,
             "gamma_bias": gamma_bias,
             "iv_expansion": iv_expansion,
+            "realized_volatility": realized_volatility,
             "vwap_alignment": vwap_alignment,
             "option_chain_bias": option_chain_bias,
             "market_profile_alignment": market_profile_alignment,
@@ -1112,12 +1145,14 @@ class ProScalperEngine:
             100
             * (
                 0.14 * max(0.0, momentum_score)
-                + 0.1 * max(0.0, aggressive_delta)
+                + 0.08 * max(0.0, aggressive_delta)
+                + 0.08 * max(0.0, cumulative_delta_strength)
                 + 0.1 * max(0.0, delta_velocity * 40)
-                + 0.12 * max(0.0, volume_acceleration)
+                + 0.11 * max(0.0, volume_acceleration)
                 + 0.1 * spread_quality
-                + 0.08 * max(0.0, gamma_bias)
-                + 0.08 * max(0.0, iv_expansion / 2)
+                + 0.07 * max(0.0, gamma_bias)
+                + 0.07 * max(0.0, iv_expansion / 2)
+                + 0.05 * max(0.0, realized_volatility / 5)
                 + 0.08 * max(0.0, vwap_alignment)
                 + 0.08 * max(0.0, option_chain_bias)
                 + 0.06 * max(0.0, market_profile_alignment * 100)
@@ -1277,6 +1312,11 @@ class ProScalperEngine:
                         den = snapshot.call_bid_qty + snapshot.call_ask_qty
                         imbalance = (snapshot.call_bid_qty - snapshot.call_ask_qty) / den if den > 0 else 0.0
                     s["imbalance"].append(float(imbalance))
+                    call_bid_qty = snapshot.call_bid_qty or 0.0
+                    call_ask_qty = snapshot.call_ask_qty or 0.0
+                    delta_step = float((call_bid_qty - call_ask_qty) * max(1.0, volume_proxy / 1000.0))
+                    prev_cum_delta = s["cum_delta"][-1] if s["cum_delta"] else 0.0
+                    s["cum_delta"].append(prev_cum_delta + delta_step)
 
                     regime = self._compute_regime(symbol)
                     micro = self._microstructure(symbol, snapshot)
@@ -1290,6 +1330,8 @@ class ProScalperEngine:
                         "weighted_score": scored.get("weighted_score", 0.0),
                         "ai": scored.get("ai", {}),
                         "features": scored.get("features", {}),
+                        "cumulative_delta": s["cum_delta"][-1] if s["cum_delta"] else 0.0,
+                        "realized_volatility": self._realized_volatility(symbol),
                         "microstructure": micro,
                         "heatmap": self.heatmaps[symbol],
                         "session_intelligence": session_intel,
@@ -1473,13 +1515,16 @@ class ProScalperEngine:
             self.performance["rejection_count"] += 1
             return {"ok": False, "reason": f"ORDER_REJECTED: {exc}"}
 
-    async def _place_exit(self, trade: TradeRecord, reason: str) -> None:
+    async def _place_exit(self, trade: TradeRecord, reason: str, exit_quantity: Optional[int] = None) -> None:
         snapshot = self.snapshots[trade.symbol]
+        qty_to_exit = int(min(trade.quantity, exit_quantity or trade.quantity))
+        if qty_to_exit <= 0:
+            return
         spread = max(0.0, (snapshot.call_ask or snapshot.call_ltp or 0.0) - (snapshot.call_bid or snapshot.call_ltp or 0.0))
         order_type = "MARKET" if spread > 1.0 else "LIMIT"
         px = float(snapshot.call_bid or snapshot.call_ltp or trade.entry_price)
         payload = {
-            "quantity": int(trade.quantity),
+            "quantity": qty_to_exit,
             "product": "I",
             "validity": "IOC",
             "price": round(px, 2) if order_type == "LIMIT" else 0,
@@ -1496,11 +1541,47 @@ class ProScalperEngine:
         try:
             await asyncio.to_thread(self.client.place_order, payload)
             latency_ms = (time.time() - t0) * 1000.0
+            exit_pnl = (px - trade.entry_price) * qty_to_exit
+            self.performance["realized_pnl"] += exit_pnl
+            partial = qty_to_exit < trade.quantity
+            slippage = max(0.0, abs(px - (snapshot.call_bid or snapshot.call_ltp or 0.0)))
+            self.performance["slippage_history"].append(slippage)
+
+            if partial:
+                trade.quantity -= qty_to_exit
+                trade.partial_exit_done = True
+                trade.trailing_state = "PARTIAL_PROFIT_LOCK"
+                trade.stop_loss = max(trade.stop_loss, trade.entry_price + 0.5)
+                partial_record = TradeRecord(
+                    trade_id=f"{trade.trade_id}-partial-{int(time.time() * 1000)}",
+                    symbol=trade.symbol,
+                    instrument_token=trade.instrument_token,
+                    quantity=qty_to_exit,
+                    side=trade.side,
+                    entry_price=trade.entry_price,
+                    entry_ts=trade.entry_ts,
+                    max_price=trade.max_price,
+                    stop_loss=trade.stop_loss,
+                    target=trade.target,
+                    tqs=trade.tqs,
+                    ai_confidence=trade.ai_confidence,
+                    regime=trade.regime,
+                    trailing_state="PARTIAL_EXIT",
+                    partial_exit_done=True,
+                    exit_price=px,
+                    exit_ts=time.time(),
+                    exit_reason=reason,
+                    order_id=trade.order_id,
+                    pnl=exit_pnl,
+                )
+                self.db.write_trade(partial_record, slippage, latency_ms)
+                self.closed_trades.append(partial_record)
+                return
+
             trade.exit_price = px
             trade.exit_ts = time.time()
             trade.exit_reason = reason
-            trade.pnl = (trade.exit_price - trade.entry_price) * trade.quantity
-            self.performance["realized_pnl"] += trade.pnl
+            trade.pnl = exit_pnl
             if trade.pnl > 0:
                 self.performance["wins"] += 1
                 self.performance["loss_streak"] = 0
@@ -1518,8 +1599,6 @@ class ProScalperEngine:
             equity_now = self.risk.trading_capital + self.performance["realized_pnl"]
             peak = max(self.performance["daily_peak_equity"], 1.0)
             self.performance["daily_drawdown_pct"] = max(0.0, (peak - equity_now) / peak)
-            slippage = max(0.0, abs((trade.exit_price or 0.0) - (snapshot.call_bid or snapshot.call_ltp or 0.0)))
-            self.performance["slippage_history"].append(slippage)
             self.db.write_trade(trade, slippage, latency_ms)
             self.closed_trades.append(trade)
             self.active_trades.pop(trade.trade_id, None)
@@ -1547,6 +1626,11 @@ class ProScalperEngine:
                 dynamic_buffer = max(0.6, atr * 1.2)
                 trade.stop_loss = max(trade.stop_loss, trade.max_price - dynamic_buffer)
                 trade.trailing_state = "MOMENTUM_TRAIL"
+            if gain >= 5.0 and not trade.partial_exit_done and trade.quantity > self.symbol_map[trade.symbol]["lot_size"]:
+                lot_size = self.symbol_map[trade.symbol]["lot_size"]
+                half_lots = max(1, (trade.quantity // lot_size) // 2)
+                partial_qty = half_lots * lot_size
+                await self._place_exit(trade, "PARTIAL_PROFIT_LOCK", exit_quantity=partial_qty)
             if gain >= 7.0 and self.last_signal.get(trade.symbol, {}).get("features", {}).get("volume_acceleration", 0.0) > 0.2:
                 trade.target = max(trade.target, trade.entry_price + 9.0)
                 trade.trailing_state = "TARGET_EXTENDED"

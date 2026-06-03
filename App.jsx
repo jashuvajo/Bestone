@@ -329,10 +329,17 @@ export default function App() {
                   <Stat label="Call LTP" value={Number(snap.call_ltp || 0).toFixed(2)} />
                   <Stat label="TQS" value={Number(signal.tqs || 0).toFixed(2)} danger={Number(signal.tqs || 0) < Number(payload.risk_config?.ai_threshold || 65)} />
                   <Stat label="AI Confidence" value={Number(signal.ai?.ai_confidence || 0).toFixed(1)} />
+                  <Stat label="Realized PnL" value={Number(perf.realized_pnl || 0).toFixed(2)} danger={Number(perf.realized_pnl || 0) < 0} />
+                  <Stat label="Unrealized PnL" value={Number(perf.unrealized_pnl || 0).toFixed(2)} danger={Number(perf.unrealized_pnl || 0) < 0} />
                   <Stat label="Exposure %" value={`${(Number(perf.exposure_pct || 0) * 100).toFixed(1)}%`} />
+                  <Stat label="Delta Velocity" value={Number(feature.delta_velocity || 0).toExponential(2)} />
+                  <Stat label="Spread Quality" value={`${(Number(feature.spread_quality || 0) * 100).toFixed(1)}%`} />
+                  <Stat label="Volatility" value={Number(signal.realized_volatility || 0).toFixed(4)} />
+                  <Stat label="Cumulative Delta" value={Number(signal.cumulative_delta || 0).toFixed(1)} />
                   <Stat label="Active Trades" value={payload.active_trades?.length || 0} />
                   <Stat label="Trailing State" value={payload.active_trades?.[0]?.trailing_state || "NA"} />
                   <Stat label="Broker Health" value={runtime.broker_state || "NA"} danger={runtime.broker_state !== "CONNECTED"} />
+                  <Stat label="Exec Latency ms" value={quality.latency.toFixed(1)} />
                   <Stat label="Order Quality" value={`rej:${quality.rejection.toFixed(1)}%`} danger={quality.rejection > 30} />
                 </div>
                 <div className="mt-3" ref={chartRef} />
@@ -392,6 +399,8 @@ export default function App() {
                   <Stat label="Unrealized PnL" value={Number(perf.unrealized_pnl || 0).toFixed(2)} danger={Number(perf.unrealized_pnl || 0) < 0} />
                   <Stat label="Positions" value={payload.portfolio?.positions?.length || 0} />
                   <Stat label="Orders" value={payload.portfolio?.orders?.length || 0} />
+                  <Stat label="Broker Status" value={runtime.broker_state || "NA"} danger={runtime.broker_state !== "CONNECTED"} />
+                  <Stat label="Exposure %" value={`${(Number(perf.exposure_pct || 0) * 100).toFixed(1)}%`} />
                 </div>
               </div>
 
