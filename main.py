@@ -85,11 +85,14 @@ class RuntimeFlags:
     broker_state: BrokerState = BrokerState.DISCONNECTED
     broker_reason: str = "Startup pending"
     websocket_alive: bool = False
+    rest_api_alive: bool = False
     api_latency_ms: float = 0.0
     websocket_latency_ms: float = 0.0
     stale_feed: bool = True
     last_ws_message_ts: float = 0.0
     last_analysis_ts: float = 0.0
+    last_rest_success_ts: float = 0.0
+    last_error: str = ""
 
 
 @dataclass
@@ -701,6 +704,8 @@ class ProScalperEngine:
         self.last_signal: Dict[str, Any] = {"NIFTY": {}, "SENSEX": {}}
         self.session_intelligence: Dict[str, Dict[str, Any]] = {"NIFTY": {}, "SENSEX": {}, "global": {}}
         self.backtest_cursor = 0
+        self.expiry_refresh_ts: Dict[str, float] = {"NIFTY": 0.0, "SENSEX": 0.0}
+        self.broker_diagnostics: Dict[str, Any] = {"last_profile": {}, "last_portfolio_error": "", "last_analysis_error": ""}
 
     def set_safe_mode(self, enabled: bool, reason: str) -> None:
         self.runtime.safe_mode = enabled
@@ -739,6 +744,8 @@ class ProScalperEngine:
             except Exception as exc:
                 self.runtime.broker_state = BrokerState.DISCONNECTED
                 self.runtime.websocket_alive = False
+                self.runtime.rest_api_alive = False
+                self.runtime.last_error = str(exc)
                 self.set_safe_mode(True, f"Startup auth unavailable: {exc}")
                 logger.warning("Starting in SAFE MODE without broker session: %s", exc)
         asyncio.create_task(self._websocket_watchdog_loop())
@@ -758,22 +765,34 @@ class ProScalperEngine:
                 await self._refresh_broker_health()
             except Exception as exc:
                 self.runtime.broker_state = BrokerState.DISCONNECTED
+                self.runtime.rest_api_alive = False
+                self.runtime.last_error = str(exc)
                 self.set_safe_mode(True, f"Session refresh failed: {exc}")
 
     async def _refresh_broker_health(self) -> None:
         ok, profile, latency_ms = await asyncio.to_thread(self.client.validate_session)
         self.runtime.api_latency_ms = latency_ms
         if not ok:
+            self.runtime.rest_api_alive = False
             self.runtime.broker_state = BrokerState.DISCONNECTED
             self.runtime.websocket_alive = False
+            self.runtime.last_error = str(profile.get("error", "Broker validation failed"))
             self.set_safe_mode(True, f"Broker validation failed: {profile.get('error')}")
             return
-        self.runtime.broker_state = (
-            BrokerState.DEGRADED if latency_ms > self.risk.max_latency_ms else BrokerState.CONNECTED
-        )
-        if self.runtime.broker_state == BrokerState.DEGRADED:
+
+        self.runtime.rest_api_alive = True
+        self.runtime.last_rest_success_ts = time.time()
+        self.runtime.last_error = ""
+        self.broker_diagnostics["last_profile"] = profile.get("data", {})
+
+        if latency_ms > self.risk.max_latency_ms:
+            self.runtime.broker_state = BrokerState.DEGRADED
             self.set_safe_mode(True, f"High API latency detected: {latency_ms:.1f} ms")
+        elif not self.runtime.websocket_alive:
+            self.runtime.broker_state = BrokerState.DEGRADED
+            self.set_safe_mode(True, "REST connected, waiting for websocket market stream")
         else:
+            self.runtime.broker_state = BrokerState.CONNECTED
             self.runtime.safe_mode = False
             self.runtime.broker_reason = "Healthy"
             if not self.runtime.auto_trading_enabled:
@@ -810,6 +829,10 @@ class ProScalperEngine:
                 async with websockets.connect(ws_uri, ping_interval=10, ping_timeout=10, max_size=2**24) as ws:
                     self.runtime.websocket_alive = True
                     self.runtime.last_ws_message_ts = time.time()
+                    if self.runtime.rest_api_alive and self.runtime.api_latency_ms <= self.risk.max_latency_ms:
+                        self.runtime.broker_state = BrokerState.CONNECTED
+                        self.runtime.safe_mode = False
+                        self.runtime.broker_reason = "Healthy"
                     logger.info("Connected to Upstox MarketDataStreamerV3 endpoint.")
                     spot_keys = [v["spot_key"] for v in self.symbol_map.values()]
                     subscribe_payload = {
@@ -828,8 +851,9 @@ class ProScalperEngine:
                         started = time.time()
             except Exception as exc:
                 self.runtime.websocket_alive = False
+                self.runtime.last_error = str(exc)
                 self.set_safe_mode(True, f"Market websocket disconnected: {exc}")
-                self.runtime.broker_state = BrokerState.DISCONNECTED
+                self.runtime.broker_state = BrokerState.DEGRADED if self.runtime.rest_api_alive else BrokerState.DISCONNECTED
                 await asyncio.sleep(3)
 
     def _consume_ws_message(self, msg: str) -> None:
@@ -852,9 +876,6 @@ class ProScalperEngine:
     async def _portfolio_refresh_loop(self) -> None:
         while True:
             try:
-                if self.runtime.broker_state == BrokerState.DISCONNECTED:
-                    await asyncio.sleep(2)
-                    continue
                 funds, positions, holdings, orders = await asyncio.gather(
                     asyncio.to_thread(self.client.get_funds_margin),
                     asyncio.to_thread(self.client.get_positions),
@@ -868,11 +889,21 @@ class ProScalperEngine:
                     "orders": orders.get("data", []),
                     "updated_at": time.time(),
                 }
+                self.runtime.rest_api_alive = True
+                self.runtime.last_rest_success_ts = time.time()
+                self.broker_diagnostics["last_portfolio_error"] = ""
                 await asyncio.sleep(3)
             except Exception as exc:
-                logger.warning("Portfolio refresh failed: %s", exc)
-                self.runtime.broker_state = BrokerState.DISCONNECTED
-                self.set_safe_mode(True, f"Portfolio endpoint failure: {exc}")
+                err = str(exc)
+                logger.warning("Portfolio refresh failed: %s", err)
+                self.broker_diagnostics["last_portfolio_error"] = err
+                self.runtime.last_error = err
+                if "401" in err or "Unauthorized" in err:
+                    self.runtime.rest_api_alive = False
+                    self.runtime.broker_state = BrokerState.DISCONNECTED
+                else:
+                    self.runtime.broker_state = BrokerState.DEGRADED if self.runtime.rest_api_alive else BrokerState.DISCONNECTED
+                self.set_safe_mode(True, f"Portfolio endpoint failure: {err}")
                 await asyncio.sleep(2)
 
     def _nearest_expiry(self, contracts_data: List[Dict[str, Any]]) -> Optional[str]:
@@ -891,8 +922,32 @@ class ProScalperEngine:
         valid = sorted(x for x in expiries if x >= today)
         return valid[0].isoformat() if valid else None
 
+    def _should_refresh_expiry(self, symbol: str, snapshot: MarketSnapshot) -> bool:
+        now = time.time()
+        if not snapshot.expiry_date:
+            return True
+        last_refresh = self.expiry_refresh_ts.get(symbol, 0.0)
+        if now - last_refresh > 300:
+            return True
+        try:
+            expiry_dt = datetime.strptime(snapshot.expiry_date, "%Y-%m-%d").date()
+            return expiry_dt < date.today()
+        except Exception:
+            return True
+
     def _extract_quote(self, quotes: Dict[str, Any], instrument_key: str) -> Dict[str, Any]:
         return quotes.get("data", {}).get(instrument_key, {})
+
+    def _quote_ltp(self, quote: Dict[str, Any]) -> Optional[float]:
+        if not isinstance(quote, dict):
+            return None
+        ltpc = quote.get("ltpc", {})
+        ltp = ltpc.get("ltp")
+        if ltp is not None:
+            return float(ltp)
+        ohlc = quote.get("ohlc", {})
+        close = ohlc.get("close")
+        return float(close) if close is not None else None
 
     def _extract_bid_ask(
         self,
@@ -1193,6 +1248,20 @@ class ProScalperEngine:
         expected_drive = float(np.clip((signal.get("features", {}).get("breakout_velocity", 0.0) * 1500), -100, 100))
         support = self.heatmaps.get(symbol, {}).get("support_resistance", {}).get("support")
         resistance = self.heatmaps.get(symbol, {}).get("support_resistance", {}).get("resistance")
+        heat = self.heatmaps.get(symbol, {})
+        strikes = heat.get("strikes", [])
+        atm = snapshot.atm_strike or (strikes[len(strikes) // 2] if strikes else None)
+        tomorrow_watchlist = []
+        for strike in strikes[:]:
+            if atm is None:
+                break
+            distance = abs(strike - atm)
+            if distance <= (50 if symbol == "NIFTY" else 200):
+                liq_idx = strikes.index(strike)
+                liq_score = float((heat.get("liquidity_walls_bid", [0])[liq_idx] if liq_idx < len(heat.get("liquidity_walls_bid", [])) else 0))
+                gamma_score = float((heat.get("gamma_walls", [0])[liq_idx] if liq_idx < len(heat.get("gamma_walls", [])) else 0))
+                tomorrow_watchlist.append({"strike": strike, "distance_from_atm": distance, "liquidity_score": liq_score, "gamma_score": gamma_score})
+        tomorrow_watchlist = sorted(tomorrow_watchlist, key=lambda x: (x["distance_from_atm"], -x["liquidity_score"], -x["gamma_score"]))[:6]
 
         result = {
             "symbol": symbol,
@@ -1208,6 +1277,7 @@ class ProScalperEngine:
             },
             "support_resistance": {"support": support, "resistance": resistance},
             "expected_opening_drive": expected_drive,
+            "tomorrow_watchlist": tomorrow_watchlist,
             "regime": regime.value,
             "post_market_review": {
                 "realized_pnl": self.performance["realized_pnl"],
@@ -1249,20 +1319,27 @@ class ProScalperEngine:
                 session = self.session_state()
                 if self.runtime.broker_state == BrokerState.DISCONNECTED:
                     await self._refresh_broker_health()
+                if not self.runtime.rest_api_alive:
                     await asyncio.sleep(1)
                     continue
                 for symbol, cfg in self.symbol_map.items():
                     snapshot = self.snapshots[symbol]
-                    if not snapshot.expiry_date:
+                    if self._should_refresh_expiry(symbol, snapshot):
                         contracts = await asyncio.to_thread(self.client.get_option_contracts, cfg["spot_key"])
                         snapshot.expiry_date = self._nearest_expiry(contracts.get("data", []))
+                        self.expiry_refresh_ts[symbol] = time.time()
                         env_expiry = os.getenv(f"{symbol}_EXPIRY", "").strip()
                         if env_expiry:
                             snapshot.expiry_date = env_expiry
                     if not snapshot.expiry_date:
                         raise RuntimeError(f"{symbol} expiry unavailable from option contracts")
 
-                    chain_resp = await asyncio.to_thread(self.client.get_option_chain, cfg["spot_key"], snapshot.expiry_date)
+                    try:
+                        chain_resp = await asyncio.to_thread(self.client.get_option_chain, cfg["spot_key"], snapshot.expiry_date)
+                    except Exception:
+                        snapshot.expiry_date = None
+                        self.expiry_refresh_ts[symbol] = 0.0
+                        raise
                     chain = chain_resp.get("data", [])
                     if not chain:
                         raise RuntimeError(f"No option chain rows for {symbol}")
@@ -1278,10 +1355,14 @@ class ProScalperEngine:
                     quote_keys = [cfg["spot_key"], snapshot.call_instrument_key or "", snapshot.put_instrument_key or ""]
                     quotes = await asyncio.to_thread(self.client.get_market_quotes, quote_keys)
                     snapshot.quote_raw = quotes.get("data", {})
+                    spot_quote = self._extract_quote(quotes, cfg["spot_key"])
+                    spot_quote_ltp = self._quote_ltp(spot_quote)
+                    if spot_quote_ltp is not None:
+                        snapshot.spot_ltp = float(spot_quote_ltp)
                     call_quote = self._extract_quote(quotes, snapshot.call_instrument_key or "")
                     put_quote = self._extract_quote(quotes, snapshot.put_instrument_key or "")
-                    snapshot.call_ltp = float(call_quote.get("ltpc", {}).get("ltp", 0.0))
-                    snapshot.put_ltp = float(put_quote.get("ltpc", {}).get("ltp", 0.0))
+                    snapshot.call_ltp = float(self._quote_ltp(call_quote) or snapshot.call_ltp or 0.0)
+                    snapshot.put_ltp = float(self._quote_ltp(put_quote) or snapshot.put_ltp or 0.0)
                     b, a, bq, aq = self._extract_bid_ask(call_quote)
                     snapshot.call_bid = b
                     snapshot.call_ask = a
@@ -1384,9 +1465,16 @@ class ProScalperEngine:
                 latest_snapshot_ts = max((x.updated_at for x in self.snapshots.values()), default=0.0)
                 self.runtime.stale_feed = (time.time() - latest_snapshot_ts) > self.risk.stale_data_seconds
             except Exception as exc:
-                logger.error("Market analysis loop error: %s", exc)
-                self.runtime.broker_state = BrokerState.DISCONNECTED
-                self.set_safe_mode(True, f"Analysis loop failed: {exc}")
+                err = str(exc)
+                logger.error("Market analysis loop error: %s", err)
+                self.broker_diagnostics["last_analysis_error"] = err
+                self.runtime.last_error = err
+                if "401" in err or "Unauthorized" in err:
+                    self.runtime.rest_api_alive = False
+                    self.runtime.broker_state = BrokerState.DISCONNECTED
+                else:
+                    self.runtime.broker_state = BrokerState.DEGRADED if self.runtime.rest_api_alive else BrokerState.DISCONNECTED
+                self.set_safe_mode(True, f"Analysis loop failed: {err}")
             elapsed = time.time() - started
             await asyncio.sleep(max(0.0, POLL_INTERVAL_SECONDS - elapsed))
 
@@ -1420,6 +1508,8 @@ class ProScalperEngine:
             return False, "MARKET_NOT_LIVE"
         if self.runtime.broker_state != BrokerState.CONNECTED:
             return False, "BROKER_NOT_HEALTHY"
+        if not self.runtime.websocket_alive:
+            return False, "WEBSOCKET_UNAVAILABLE"
         if self.runtime.api_latency_ms > self.risk.max_latency_ms:
             return False, "LATENCY_THRESHOLD_BREACHED"
         if self.runtime.stale_feed:
@@ -1748,9 +1838,12 @@ class ProScalperEngine:
                 "broker_state": self.runtime.broker_state.value,
                 "broker_reason": self.runtime.broker_reason,
                 "websocket_alive": self.runtime.websocket_alive,
+                "rest_api_alive": self.runtime.rest_api_alive,
                 "stale_feed": self.runtime.stale_feed,
                 "api_latency_ms": self.runtime.api_latency_ms,
                 "websocket_latency_ms": self.runtime.websocket_latency_ms,
+                "last_rest_success_ts": self.runtime.last_rest_success_ts,
+                "last_error": self.runtime.last_error,
             },
             "risk_config": self.risk.__dict__,
             "portfolio": self.portfolio_cache,
@@ -1769,6 +1862,7 @@ class ProScalperEngine:
             "recent_trades": [x.__dict__ for x in list(self.closed_trades)[-40:]],
             "heatmaps": self.heatmaps,
             "backtesting": self._backtesting_snapshot(),
+            "broker_diagnostics": self.broker_diagnostics,
         }
 
     async def _broadcast_loop(self) -> None:
@@ -1869,6 +1963,17 @@ async def set_trading(enabled: bool) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Cannot enable trading while SAFE MODE is active.")
     engine.runtime.auto_trading_enabled = enabled
     return {"auto_trading_enabled": engine.runtime.auto_trading_enabled}
+
+
+@app.get("/api/broker/status")
+async def broker_status() -> Dict[str, Any]:
+    payload = engine._dashboard_payload()
+    return {
+        "runtime": payload.get("runtime", {}),
+        "portfolio_last_updated": payload.get("portfolio", {}).get("updated_at"),
+        "funds_snapshot": payload.get("portfolio", {}).get("funds", {}),
+        "broker_diagnostics": payload.get("broker_diagnostics", {}),
+    }
 
 
 @app.websocket("/ws/dashboard")

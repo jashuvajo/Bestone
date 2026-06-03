@@ -148,6 +148,8 @@ export default function App() {
   const perf = payload.performance || {};
   const runtime = payload.runtime || {};
   const sessionIntel = payload.session_intelligence?.[selectedSymbol] || {};
+  const formatTs = (ts) => (ts ? new Date(ts * 1000).toLocaleString() : "NA");
+  const tomorrowWatchlist = sessionIntel.tomorrow_watchlist || [];
 
   const resolvedWsUrl = useMemo(() => {
     if (WS_URL) return WS_URL;
@@ -448,6 +450,8 @@ export default function App() {
                   <Stat label="Positions" value={payload.portfolio?.positions?.length || 0} />
                   <Stat label="Orders" value={payload.portfolio?.orders?.length || 0} />
                   <Stat label="Broker Status" value={runtime.broker_state || "NA"} danger={runtime.broker_state !== "CONNECTED"} />
+                  <Stat label="REST API" value={runtime.rest_api_alive ? "CONNECTED" : "DISCONNECTED"} danger={!runtime.rest_api_alive} />
+                  <Stat label="Funds Updated" value={formatTs(payload.portfolio?.updated_at || 0)} />
                   <Stat label="Exposure %" value={`${(Number(perf.exposure_pct || 0) * 100).toFixed(1)}%`} />
                 </div>
               </div>
@@ -478,9 +482,12 @@ export default function App() {
                 </div>
                 <div className="mt-2 grid grid-cols-2 gap-1 text-xs">
                   <div>Broker: {runtime.broker_state}</div>
+                  <div>REST Alive: {String(runtime.rest_api_alive)}</div>
                   <div>WS Alive: {String(runtime.websocket_alive)}</div>
                   <div>Stale Feed: {String(runtime.stale_feed)}</div>
                   <div>Fill Drift: {Number(perf.fill_drift || 0).toFixed(2)}</div>
+                  <div>Last REST: {formatTs(runtime.last_rest_success_ts || 0)}</div>
+                  <div className="col-span-2 truncate">Error: {runtime.last_error || "none"}</div>
                 </div>
               </div>
             </section>
@@ -569,6 +576,16 @@ export default function App() {
                   <div>Gap vs Prev Close: {Number(sessionIntel.gap_pct_vs_prev_close || 0).toFixed(2)}%</div>
                   <div>Expected Drive: {Number(sessionIntel.expected_opening_drive || 0).toFixed(2)}</div>
                   <div>GIFT Change: {Number(payload.session_intelligence?.global?.gift?.change_pct || 0).toFixed(2)}%</div>
+                  <div className="mt-2 text-cyan-300">Tomorrow Watchlist:</div>
+                  {tomorrowWatchlist.length === 0 ? (
+                    <div className="text-slate-400">No candidates yet</div>
+                  ) : (
+                    tomorrowWatchlist.slice(0, 4).map((w) => (
+                      <div key={`${selectedSymbol}-${w.strike}`} className="rounded bg-slate-950/70 px-2 py-1">
+                        {w.strike} | dATM {Number(w.distance_from_atm || 0).toFixed(0)} | liq {Number(w.liquidity_score || 0).toFixed(0)}
+                      </div>
+                    ))
+                  )}
                 </div>
               </div>
 
