@@ -1,14 +1,15 @@
 import asyncio
+import gzip
 import json
 import logging
-import math
 import os
 import sqlite3
 import statistics
 import time
+import zlib
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from enum import Enum
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
@@ -31,12 +32,12 @@ try:
 except Exception:  # pragma: no cover
     lgb = None
 
-try:  # Optional infrastructure
+try:
     import psycopg2
 except Exception:  # pragma: no cover
     psycopg2 = None
 
-try:  # Optional infrastructure
+try:
     import redis
 except Exception:  # pragma: no cover
     redis = None
@@ -103,6 +104,7 @@ class RiskConfig:
     max_latency_ms: int = 800
     ai_threshold: float = 65.0
     aggression_level: float = 1.0
+    max_symbol_concentration_pct: float = 0.7
 
 
 @dataclass
@@ -166,6 +168,7 @@ class ConfigPayload(BaseModel):
     max_latency_ms: Optional[int] = None
     ai_threshold: Optional[float] = None
     aggression_level: Optional[float] = None
+    max_symbol_concentration_pct: Optional[float] = None
     auto_trading_enabled: Optional[bool] = None
 
 
@@ -182,6 +185,7 @@ class UpstoxClient:
         self.api_secret = os.getenv("UPSTOX_API_SECRET", "").strip()
         self.redirect_uri = os.getenv("UPSTOX_REDIRECT_URI", "").strip()
         self.auth_code = os.getenv("UPSTOX_AUTH_CODE", "").strip()
+        self.refresh_token = os.getenv("UPSTOX_REFRESH_TOKEN", "").strip()
         self.access_token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
         self.extended_token = os.getenv("UPSTOX_EXTENDED_TOKEN", "").strip()
         self.http = requests.Session()
@@ -189,29 +193,12 @@ class UpstoxClient:
         self.last_auth_refresh = 0.0
 
     def _auth_headers(self) -> Dict[str, str]:
-        if not self.access_token:
-            return {"Accept": "application/json", "Content-Type": "application/json"}
-        return {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.access_token}",
-        }
-
-    def authenticate(self) -> None:
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
         if self.access_token:
-            logger.info("Using provided UPSTOX_ACCESS_TOKEN.")
-            return
-        if not all([self.api_key, self.api_secret, self.redirect_uri, self.auth_code]):
-            raise RuntimeError(
-                "Missing Upstox credentials. Set UPSTOX_ACCESS_TOKEN or API key/secret/redirect/auth_code."
-            )
-        payload = {
-            "code": self.auth_code,
-            "client_id": self.api_key,
-            "client_secret": self.api_secret,
-            "redirect_uri": self.redirect_uri,
-            "grant_type": "authorization_code",
-        }
+            headers["Authorization"] = f"Bearer {self.access_token}"
+        return headers
+
+    def _exchange_token(self, payload: Dict[str, str]) -> Dict[str, Any]:
         response = self.http.post(
             f"{API_BASE}/v2/login/authorization/token",
             data=payload,
@@ -225,116 +212,153 @@ class UpstoxClient:
             raise RuntimeError(f"Upstox token exchange failed: {result}")
         self.access_token = token
         self.extended_token = result.get("extended_token", "")
+        self.refresh_token = result.get("refresh_token", self.refresh_token)
         self.last_auth_refresh = time.time()
-        logger.info("Upstox OAuth token acquired successfully.")
+        return result
+
+    def authenticate(self, force: bool = False) -> None:
+        if self.access_token and not force:
+            logger.info("Using current UPSTOX_ACCESS_TOKEN.")
+            return
+        runtime_token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
+        if runtime_token:
+            self.access_token = runtime_token
+            self.last_auth_refresh = time.time()
+            logger.info("Loaded runtime UPSTOX_ACCESS_TOKEN for session recovery.")
+            return
+        if self.refresh_token and self.api_key and self.api_secret:
+            try:
+                self._exchange_token(
+                    {
+                        "refresh_token": self.refresh_token,
+                        "client_id": self.api_key,
+                        "client_secret": self.api_secret,
+                        "grant_type": "refresh_token",
+                    }
+                )
+                logger.info("Upstox token refreshed using refresh_token grant.")
+                return
+            except Exception as exc:
+                logger.warning("Refresh-token flow unavailable/failed: %s", exc)
+        if all([self.api_key, self.api_secret, self.redirect_uri, self.auth_code]):
+            self._exchange_token(
+                {
+                    "code": self.auth_code,
+                    "client_id": self.api_key,
+                    "client_secret": self.api_secret,
+                    "redirect_uri": self.redirect_uri,
+                    "grant_type": "authorization_code",
+                }
+            )
+            logger.info("Upstox OAuth token acquired successfully.")
+            return
+        raise RuntimeError(
+            "Missing recoverable Upstox auth material. Provide UPSTOX_ACCESS_TOKEN or full OAuth credentials."
+        )
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        form_payload: Optional[Dict[str, Any]] = None,
+        base_url: str = API_BASE,
+        timeout: float = 6,
+        retry_auth: bool = True,
+    ) -> Dict[str, Any]:
+        url = f"{base_url}{path}"
+        headers = self._auth_headers()
+        if form_payload is not None:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        response = self.http.request(
+            method,
+            url,
+            headers=headers,
+            params=params,
+            json=payload,
+            data=form_payload,
+            timeout=timeout,
+        )
+        if response.status_code == 401 and retry_auth:
+            self.authenticate(force=True)
+            headers = self._auth_headers()
+            if form_payload is not None:
+                headers["Content-Type"] = "application/x-www-form-urlencoded"
+            response = self.http.request(
+                method,
+                url,
+                headers=headers,
+                params=params,
+                json=payload,
+                data=form_payload,
+                timeout=timeout,
+            )
+        response.raise_for_status()
+        text = response.text.strip()
+        if not text:
+            return {}
+        return response.json()
 
     def validate_session(self) -> Tuple[bool, Dict[str, Any], float]:
         started = time.time()
         try:
-            response = self.http.get(
-                f"{API_BASE}/v2/user/profile",
-                headers=self._auth_headers(),
-                timeout=6,
-            )
-            latency_ms = (time.time() - started) * 1000.0
-            if response.status_code == 401:
-                return False, {"error": "Unauthorized"}, latency_ms
-            response.raise_for_status()
-            return True, response.json(), latency_ms
+            result = self._request("GET", "/v2/user/profile", timeout=6, retry_auth=True)
+            return True, result, (time.time() - started) * 1000.0
         except Exception as exc:
-            latency_ms = (time.time() - started) * 1000.0
-            return False, {"error": str(exc)}, latency_ms
+            return False, {"error": str(exc)}, (time.time() - started) * 1000.0
 
     def get_ws_authorized_uri(self) -> str:
-        response = self.http.get(
-            f"{API_BASE}/v3/feed/market-data-feed/authorize",
-            headers=self._auth_headers(),
-            timeout=6,
-        )
-        response.raise_for_status()
-        data = response.json().get("data", {})
+        result = self._request("GET", "/v3/feed/market-data-feed/authorize", timeout=6, retry_auth=True)
+        data = result.get("data", {})
         ws_uri = data.get("authorized_redirect_uri")
         if not ws_uri:
-            raise RuntimeError(f"Missing websocket redirect URI: {response.text}")
+            raise RuntimeError(f"Missing websocket redirect URI in response: {result}")
         return ws_uri
 
     def get_funds_margin(self) -> Dict[str, Any]:
-        response = self.http.get(
-            f"{API_BASE}/v2/user/get-funds-and-margin",
-            headers=self._auth_headers(),
-            timeout=6,
-        )
-        response.raise_for_status()
-        return response.json()
+        return self._request("GET", "/v2/user/get-funds-and-margin", timeout=6)
 
     def get_positions(self) -> Dict[str, Any]:
-        response = self.http.get(
-            f"{API_BASE}/v2/portfolio/short-term-positions",
-            headers=self._auth_headers(),
-            timeout=6,
-        )
-        response.raise_for_status()
-        return response.json()
+        return self._request("GET", "/v2/portfolio/short-term-positions", timeout=6)
 
     def get_holdings(self) -> Dict[str, Any]:
-        response = self.http.get(
-            f"{API_BASE}/v2/portfolio/long-term-holdings",
-            headers=self._auth_headers(),
-            timeout=6,
-        )
-        response.raise_for_status()
-        return response.json()
+        return self._request("GET", "/v2/portfolio/long-term-holdings", timeout=6)
 
     def get_orderbook(self) -> Dict[str, Any]:
-        response = self.http.get(
-            f"{API_BASE}/v2/order/retrieve-all",
-            headers=self._auth_headers(),
-            timeout=6,
-        )
-        response.raise_for_status()
-        return response.json()
+        return self._request("GET", "/v2/order/retrieve-all", timeout=6)
 
     def get_option_contracts(self, spot_key: str) -> Dict[str, Any]:
-        response = self.http.get(
-            f"{API_BASE}/v2/option/contract",
-            params={"instrument_key": spot_key},
-            headers=self._auth_headers(),
-            timeout=6,
-        )
-        response.raise_for_status()
-        return response.json()
+        return self._request("GET", "/v2/option/contract", params={"instrument_key": spot_key}, timeout=6)
 
     def get_option_chain(self, spot_key: str, expiry_date: str) -> Dict[str, Any]:
-        response = self.http.get(
-            f"{API_BASE}/v2/option/chain",
+        return self._request(
+            "GET",
+            "/v2/option/chain",
             params={"instrument_key": spot_key, "expiry_date": expiry_date},
-            headers=self._auth_headers(),
             timeout=8,
         )
-        response.raise_for_status()
-        return response.json()
 
     def get_market_quotes(self, instrument_keys: List[str]) -> Dict[str, Any]:
-        if not instrument_keys:
+        keys = [k for k in instrument_keys if k]
+        if not keys:
             return {"status": "success", "data": {}}
-        response = self.http.get(
-            f"{API_BASE}/v2/market-quote/quotes",
-            params={"instrument_key": ",".join(instrument_keys)},
-            headers=self._auth_headers(),
+        return self._request(
+            "GET",
+            "/v2/market-quote/quotes",
+            params={"instrument_key": ",".join(keys)},
             timeout=6,
         )
-        response.raise_for_status()
-        return response.json()
 
     def place_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        response = self.http.post(
-            f"{ORDER_BASE}/v3/order/place",
-            headers=self._auth_headers(),
-            json=payload,
+        return self._request(
+            "POST",
+            "/v3/order/place",
+            base_url=ORDER_BASE,
+            payload=payload,
             timeout=6,
         )
-        response.raise_for_status()
-        return response.json()
 
 
 class DatabaseStore:
@@ -353,7 +377,6 @@ class DatabaseStore:
                 logger.info("Connected to PostgreSQL persistence.")
             except Exception as exc:
                 logger.warning("PostgreSQL connection failed, falling back to SQLite: %s", exc)
-                self.pg_conn = None
 
     def _init_schema(self) -> None:
         cursor = self._sqlite.cursor()
@@ -493,6 +516,28 @@ class DatabaseStore:
         )
         self._sqlite.commit()
 
+    def recent_ticks(self, limit: int = 300) -> List[Dict[str, Any]]:
+        cursor = self._sqlite.execute(
+            """
+            SELECT ts, symbol, spot_ltp, call_ltp, tqs, ai_confidence, regime
+            FROM ticks ORDER BY ts DESC LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = cursor.fetchall()
+        return [
+            {
+                "ts": row[0],
+                "symbol": row[1],
+                "spot_ltp": row[2],
+                "call_ltp": row[3],
+                "tqs": row[4],
+                "ai_confidence": row[5],
+                "regime": row[6],
+            }
+            for row in rows
+        ]
+
 
 class ModelEngine:
     def __init__(self) -> None:
@@ -612,6 +657,7 @@ class ProScalperEngine:
             "NIFTY": {"spot_key": "NSE_INDEX|Nifty 50", "lot_size": 65},
             "SENSEX": {"spot_key": "BSE_INDEX|SENSEX", "lot_size": 20},
         }
+        self.gift_instrument_key = os.getenv("GIFT_NIFTY_INSTRUMENT_KEY", "").strip()
         self.snapshots: Dict[str, MarketSnapshot] = {
             symbol: MarketSnapshot(symbol=symbol, spot_key=v["spot_key"]) for symbol, v in self.symbol_map.items()
         }
@@ -649,6 +695,8 @@ class ProScalperEngine:
         }
         self.heatmaps: Dict[str, Dict[str, Any]] = {"NIFTY": {}, "SENSEX": {}}
         self.last_signal: Dict[str, Any] = {"NIFTY": {}, "SENSEX": {}}
+        self.session_intelligence: Dict[str, Dict[str, Any]] = {"NIFTY": {}, "SENSEX": {}, "global": {}}
+        self.backtest_cursor = 0
 
     def set_safe_mode(self, enabled: bool, reason: str) -> None:
         self.runtime.safe_mode = enabled
@@ -701,9 +749,27 @@ class ProScalperEngine:
         else:
             self.runtime.safe_mode = False
             self.runtime.broker_reason = "Healthy"
-            if self.runtime.auto_trading_enabled is False:
+            if not self.runtime.auto_trading_enabled:
                 self.runtime.auto_trading_enabled = True
         logger.info("Broker profile validated: %s", profile.get("data", {}).get("user_id", "unknown"))
+
+    def _decode_ws_payload(self, message: Any) -> Optional[str]:
+        if isinstance(message, str):
+            return message
+        if not isinstance(message, (bytes, bytearray)):
+            return None
+        blob = bytes(message)
+        decoders = [
+            lambda b: b.decode("utf-8"),
+            lambda b: gzip.decompress(b).decode("utf-8"),
+            lambda b: zlib.decompress(b).decode("utf-8"),
+        ]
+        for decoder in decoders:
+            try:
+                return decoder(blob)
+            except Exception:
+                continue
+        return None
 
     async def _websocket_watchdog_loop(self) -> None:
         while True:
@@ -714,7 +780,7 @@ class ProScalperEngine:
                     continue
                 ws_uri = await asyncio.to_thread(self.client.get_ws_authorized_uri)
                 started = time.time()
-                async with websockets.connect(ws_uri, ping_interval=10, ping_timeout=10, max_size=2**22) as ws:
+                async with websockets.connect(ws_uri, ping_interval=10, ping_timeout=10, max_size=2**24) as ws:
                     self.runtime.websocket_alive = True
                     self.runtime.last_ws_message_ts = time.time()
                     logger.info("Connected to Upstox MarketDataStreamerV3 endpoint.")
@@ -726,12 +792,12 @@ class ProScalperEngine:
                     }
                     await ws.send(json.dumps(subscribe_payload))
                     while True:
-                        msg = await asyncio.wait_for(ws.recv(), timeout=20)
+                        raw_msg = await asyncio.wait_for(ws.recv(), timeout=20)
                         self.runtime.last_ws_message_ts = time.time()
                         self.runtime.websocket_latency_ms = (time.time() - started) * 1000.0
-                        if isinstance(msg, bytes):
-                            continue
-                        self._consume_ws_message(msg)
+                        decoded = self._decode_ws_payload(raw_msg)
+                        if decoded:
+                            self._consume_ws_message(decoded)
                         started = time.time()
             except Exception as exc:
                 self.runtime.websocket_alive = False
@@ -796,14 +862,15 @@ class ProScalperEngine:
             except Exception:
                 continue
         valid = sorted(x for x in expiries if x >= today)
-        if not valid:
-            return None
-        return valid[0].isoformat()
+        return valid[0].isoformat() if valid else None
 
     def _extract_quote(self, quotes: Dict[str, Any], instrument_key: str) -> Dict[str, Any]:
         return quotes.get("data", {}).get(instrument_key, {})
 
-    def _extract_bid_ask(self, quote: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    def _extract_bid_ask(
+        self,
+        quote: Dict[str, Any],
+    ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
         depth = quote.get("depth") or {}
         bids = depth.get("buy", []) if isinstance(depth, dict) else []
         asks = depth.get("sell", []) if isinstance(depth, dict) else []
@@ -816,12 +883,16 @@ class ProScalperEngine:
     def _build_heatmap(self, symbol: str, chain: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not chain:
             return {}
-        strikes = []
-        bid_liquidity = []
-        ask_liquidity = []
-        gamma_values = []
-        delta_values = []
-        volume_values = []
+        strikes: List[float] = []
+        bid_liquidity: List[float] = []
+        ask_liquidity: List[float] = []
+        gamma_values: List[float] = []
+        delta_values: List[float] = []
+        volume_values: List[float] = []
+        call_oi_values: List[float] = []
+        put_oi_values: List[float] = []
+        ladder_rows: List[Dict[str, Any]] = []
+
         for row in chain:
             strike = float(row.get("strike_price", 0.0))
             call_data = row.get("call_options", {})
@@ -830,6 +901,7 @@ class ProScalperEngine:
             put_md = put_data.get("market_data", {})
             call_g = call_data.get("option_greeks", {})
             put_g = put_data.get("option_greeks", {})
+
             call_oi = float(call_md.get("oi", 0.0))
             put_oi = float(put_md.get("oi", 0.0))
             call_bid = float(call_md.get("bid_qty", 0.0))
@@ -839,12 +911,51 @@ class ProScalperEngine:
             gamma = abs(float(call_g.get("gamma", 0.0))) * call_oi + abs(float(put_g.get("gamma", 0.0))) * put_oi
             delta_heat = float(call_g.get("delta", 0.0)) - float(put_g.get("delta", 0.0))
             volume = float(call_md.get("volume", 0.0)) + float(put_md.get("volume", 0.0))
+
             strikes.append(strike)
             bid_liquidity.append(call_bid + put_bid)
             ask_liquidity.append(call_ask + put_ask)
             gamma_values.append(gamma)
             delta_values.append(delta_heat)
             volume_values.append(volume)
+            call_oi_values.append(call_oi)
+            put_oi_values.append(put_oi)
+            ladder_rows.append(
+                {
+                    "strike": strike,
+                    "bid_qty": call_bid + put_bid,
+                    "ask_qty": call_ask + put_ask,
+                    "call_bid_qty": call_bid,
+                    "put_bid_qty": put_bid,
+                    "call_ask_qty": call_ask,
+                    "put_ask_qty": put_ask,
+                }
+            )
+
+        total_liq = np.array(bid_liquidity) + np.array(ask_liquidity)
+        vol_arr = np.array(volume_values)
+        delta_arr = np.abs(np.array(delta_values))
+        call_oi_arr = np.array(call_oi_values)
+        put_oi_arr = np.array(put_oi_values)
+
+        liq_void_threshold = float(np.quantile(total_liq, 0.2)) if len(total_liq) else 0.0
+        sweep_threshold = float(np.quantile(vol_arr, 0.8)) if len(vol_arr) else 0.0
+        delta_threshold = float(np.quantile(delta_arr, 0.75)) if len(delta_arr) else 0.0
+        oi_cluster_threshold = float(np.quantile(call_oi_arr + put_oi_arr, 0.85)) if len(call_oi_arr) else 0.0
+
+        liquidity_voids = [strikes[i] for i, val in enumerate(total_liq) if val <= liq_void_threshold]
+        sweep_zones = [
+            strikes[i]
+            for i, _ in enumerate(strikes)
+            if vol_arr[i] >= sweep_threshold and delta_arr[i] >= delta_threshold
+        ]
+        stop_loss_clusters = [
+            strikes[i] for i in range(len(strikes)) if (call_oi_arr[i] + put_oi_arr[i]) >= oi_cluster_threshold
+        ]
+
+        support_strike = strikes[int(np.argmax(put_oi_arr))] if len(strikes) else None
+        resistance_strike = strikes[int(np.argmax(call_oi_arr))] if len(strikes) else None
+
         heatmap = {
             "symbol": symbol,
             "strikes": strikes,
@@ -853,6 +964,11 @@ class ProScalperEngine:
             "gamma_walls": gamma_values,
             "delta_heat": delta_values,
             "volume_concentration": volume_values,
+            "stop_loss_clusters": stop_loss_clusters,
+            "sweep_zones": sweep_zones,
+            "liquidity_voids": liquidity_voids,
+            "support_resistance": {"support": support_strike, "resistance": resistance_strike},
+            "bid_ask_ladders": ladder_rows,
             "updated_at": time.time(),
         }
         self.heatmaps[symbol] = heatmap
@@ -884,13 +1000,9 @@ class ProScalperEngine:
     def _vwap(self, prices: Deque[float], volumes: Deque[float]) -> float:
         if not prices or not volumes:
             return 0.0
-        if len(prices) != len(volumes):
-            min_len = min(len(prices), len(volumes))
-            p = np.array(list(prices)[-min_len:])
-            v = np.array(list(volumes)[-min_len:])
-        else:
-            p = np.array(list(prices))
-            v = np.array(list(volumes))
+        min_len = min(len(prices), len(volumes))
+        p = np.array(list(prices)[-min_len:])
+        v = np.array(list(volumes)[-min_len:])
         if float(v.sum()) <= 0:
             return float(p[-1])
         return float(np.dot(p, v) / v.sum())
@@ -906,12 +1018,8 @@ class ProScalperEngine:
             imbalance = ((snapshot.call_bid_qty - snapshot.call_ask_qty) / denom) if denom > 0 else 0.0
         recent_imbalance = list(s["imbalance"])[-20:]
         recent_spread = list(s["spread"])[-20:]
-        bid_absorption = float(
-            np.mean([1 for x in recent_imbalance if x > 0.1]) / max(len(recent_imbalance), 1)
-        )
-        ask_absorption = float(
-            np.mean([1 for x in recent_imbalance if x < -0.1]) / max(len(recent_imbalance), 1)
-        )
+        bid_absorption = float(np.mean([1 for x in recent_imbalance if x > 0.1]) / max(len(recent_imbalance), 1))
+        ask_absorption = float(np.mean([1 for x in recent_imbalance if x < -0.1]) / max(len(recent_imbalance), 1))
         spoofing = 1.0 if recent_imbalance and abs(recent_imbalance[-1] - imbalance) > 0.45 else 0.0
         iceberg = 1.0 if recent_spread and statistics.mean(recent_spread) < 0.8 and abs(imbalance) > 0.4 else 0.0
         liquidity_vacuum = 1.0 if spread > 1.6 else 0.0
@@ -920,6 +1028,7 @@ class ProScalperEngine:
         stacked_bids = float(max(0.0, imbalance))
         stacked_offers = float(max(0.0, -imbalance))
         aggressive_mo_imbalance = float(imbalance * max(1.0, sweep_velocity))
+        liquidity_sweep_confirmation = 1.0 if sweep_velocity > 0 and aggressive_mo_imbalance > 0 and spread < 1.2 else 0.0
         return {
             "spread": spread,
             "imbalance": imbalance,
@@ -933,6 +1042,7 @@ class ProScalperEngine:
             "stacked_bids": stacked_bids,
             "stacked_offers": stacked_offers,
             "aggressive_mo_imbalance": aggressive_mo_imbalance,
+            "liquidity_sweep_confirmation": liquidity_sweep_confirmation,
         }
 
     def _score_trade_quality(
@@ -950,12 +1060,14 @@ class ProScalperEngine:
         momentum_score = float(np.clip((call[-1] - call[-6]) / 5.0, -1.0, 1.0))
         aggressive_delta = float(np.clip(micro["aggressive_mo_imbalance"], -1.0, 1.0))
         delta_velocity = float(np.clip((spot[-1] - spot[-4]) / max(spot[-4], 1e-9), -0.02, 0.02))
-        volume_acceleration = float(
-            np.clip(
-                (statistics.mean(list(s["volume_proxy"])[-5:]) - statistics.mean(list(s["volume_proxy"])[-20:-5]))
-                / max(statistics.mean(list(s["volume_proxy"])[-20:-5]), 1.0),
-                -1.0,
-                2.0,
+        volume_acceleration = (
+            float(
+                np.clip(
+                    (statistics.mean(list(s["volume_proxy"])[-5:]) - statistics.mean(list(s["volume_proxy"])[-20:-5]))
+                    / max(statistics.mean(list(s["volume_proxy"])[-20:-5]), 1.0),
+                    -1.0,
+                    2.0,
+                )
             )
             if len(s["volume_proxy"]) > 20
             else 0.0
@@ -966,10 +1078,19 @@ class ProScalperEngine:
         vwap_val = self._vwap(s["call"], s["volume_proxy"])
         vwap_alignment = 1.0 if call[-1] > vwap_val else -0.6
         option_chain_bias = float(
-            np.clip((snapshot.total_call_oi - snapshot.total_put_oi) / max(snapshot.total_call_oi + snapshot.total_put_oi, 1.0), -1.0, 1.0)
+            np.clip(
+                (snapshot.total_call_oi - snapshot.total_put_oi)
+                / max(snapshot.total_call_oi + snapshot.total_put_oi, 1.0),
+                -1.0,
+                1.0,
+            )
         )
-        market_profile_alignment = float(np.clip((spot[-1] - np.mean(spot[-30:])) / max(np.mean(spot[-30:]), 1.0), -0.01, 0.01))
-        regime_support = 1.0 if regime in [MarketRegime.TRENDING, MarketRegime.BREAKOUT, MarketRegime.EXPANDING_VOLATILITY] else -0.8
+        market_profile_alignment = float(
+            np.clip((spot[-1] - np.mean(spot[-30:])) / max(np.mean(spot[-30:]), 1.0), -0.01, 0.01)
+        )
+        regime_support = (
+            1.0 if regime in [MarketRegime.TRENDING, MarketRegime.BREAKOUT, MarketRegime.EXPANDING_VOLATILITY] else -0.8
+        )
         breakout_velocity = float(np.clip((call[-1] - call[-3]) / max(call[-3], 1e-9), -0.05, 0.05))
         orderbook_imbalance = micro["imbalance"]
         features = {
@@ -1007,6 +1128,74 @@ class ProScalperEngine:
         tqs = float(np.clip(0.65 * weighted_score + 0.35 * ai["ai_confidence"], 0.0, 100.0))
         return {"tqs": tqs, "weighted_score": weighted_score, "features": features, "ai": ai}
 
+    def _quote_close(self, snapshot: MarketSnapshot) -> Optional[float]:
+        spot_quote = snapshot.quote_raw.get(snapshot.spot_key, {}) if snapshot.quote_raw else {}
+        ohlc = spot_quote.get("ohlc", {}) if isinstance(spot_quote, dict) else {}
+        close = ohlc.get("close")
+        return float(close) if close is not None else None
+
+    def _build_session_intelligence(self, symbol: str, regime: MarketRegime) -> Dict[str, Any]:
+        session = self.session_state()
+        snapshot = self.snapshots[symbol]
+        signal = self.last_signal.get(symbol, {})
+        prev_close = self._quote_close(snapshot)
+        spot = snapshot.spot_ltp or 0.0
+        gap_pct = ((spot - prev_close) / prev_close) * 100.0 if prev_close else 0.0
+        pcr_bias = float(np.clip((1.2 - snapshot.pcr), -1.0, 1.0))
+        overnight_sentiment = float(np.clip(gap_pct * 8 + pcr_bias * 20 + (signal.get("tqs", 0.0) - 50) * 0.3, -100, 100))
+        gap_probability = float(np.clip(abs(gap_pct) * 12 + snapshot.iv * 0.4 + abs(pcr_bias) * 20, 0, 100))
+        expected_drive = float(np.clip((signal.get("features", {}).get("breakout_velocity", 0.0) * 1500), -100, 100))
+        support = self.heatmaps.get(symbol, {}).get("support_resistance", {}).get("support")
+        resistance = self.heatmaps.get(symbol, {}).get("support_resistance", {}).get("resistance")
+
+        result = {
+            "symbol": symbol,
+            "session": session.value,
+            "overnight_sentiment": overnight_sentiment,
+            "gap_probability": gap_probability,
+            "gap_pct_vs_prev_close": gap_pct,
+            "option_chain_positioning": {
+                "pcr": snapshot.pcr,
+                "total_call_oi": snapshot.total_call_oi,
+                "total_put_oi": snapshot.total_put_oi,
+                "iv": snapshot.iv,
+            },
+            "support_resistance": {"support": support, "resistance": resistance},
+            "expected_opening_drive": expected_drive,
+            "regime": regime.value,
+            "post_market_review": {
+                "realized_pnl": self.performance["realized_pnl"],
+                "wins": self.performance["wins"],
+                "losses": self.performance["losses"],
+                "execution_quality": self._execution_quality(),
+            },
+            "closed_market_replay_available": True,
+            "updated_at": time.time(),
+        }
+        self.session_intelligence[symbol] = result
+        return result
+
+    async def _gift_influence(self) -> Dict[str, Any]:
+        if not self.gift_instrument_key:
+            return {"gift_key_configured": False}
+        try:
+            quotes = await asyncio.to_thread(self.client.get_market_quotes, [self.gift_instrument_key])
+            quote = quotes.get("data", {}).get(self.gift_instrument_key, {})
+            ltpc = quote.get("ltpc", {})
+            ohlc = quote.get("ohlc", {})
+            ltp = float(ltpc.get("ltp", 0.0))
+            close = float(ohlc.get("close", 0.0))
+            change_pct = ((ltp - close) / close) * 100.0 if close else 0.0
+            return {
+                "gift_key_configured": True,
+                "instrument_key": self.gift_instrument_key,
+                "ltp": ltp,
+                "prev_close": close,
+                "change_pct": change_pct,
+            }
+        except Exception as exc:
+            return {"gift_key_configured": True, "error": str(exc)}
+
     async def _market_analysis_loop(self) -> None:
         while True:
             started = time.time()
@@ -1026,6 +1215,7 @@ class ProScalperEngine:
                             snapshot.expiry_date = env_expiry
                     if not snapshot.expiry_date:
                         raise RuntimeError(f"{symbol} expiry unavailable from option contracts")
+
                     chain_resp = await asyncio.to_thread(self.client.get_option_chain, cfg["spot_key"], snapshot.expiry_date)
                     chain = chain_resp.get("data", [])
                     if not chain:
@@ -1039,33 +1229,21 @@ class ProScalperEngine:
                     put_data = atm_row.get("put_options", {})
                     snapshot.call_instrument_key = call_data.get("instrument_key")
                     snapshot.put_instrument_key = put_data.get("instrument_key")
-                    quote_keys = [cfg["spot_key"]]
-                    if snapshot.call_instrument_key:
-                        quote_keys.append(snapshot.call_instrument_key)
-                    if snapshot.put_instrument_key:
-                        quote_keys.append(snapshot.put_instrument_key)
+                    quote_keys = [cfg["spot_key"], snapshot.call_instrument_key or "", snapshot.put_instrument_key or ""]
                     quotes = await asyncio.to_thread(self.client.get_market_quotes, quote_keys)
                     snapshot.quote_raw = quotes.get("data", {})
                     call_quote = self._extract_quote(quotes, snapshot.call_instrument_key or "")
                     put_quote = self._extract_quote(quotes, snapshot.put_instrument_key or "")
-                    call_ltpc = call_quote.get("ltpc", {})
-                    put_ltpc = put_quote.get("ltpc", {})
-                    snapshot.call_ltp = float(call_ltpc.get("ltp", 0.0))
-                    snapshot.put_ltp = float(put_ltpc.get("ltp", 0.0))
+                    snapshot.call_ltp = float(call_quote.get("ltpc", {}).get("ltp", 0.0))
+                    snapshot.put_ltp = float(put_quote.get("ltpc", {}).get("ltp", 0.0))
                     b, a, bq, aq = self._extract_bid_ask(call_quote)
                     snapshot.call_bid = b
                     snapshot.call_ask = a
                     snapshot.call_bid_qty = bq
                     snapshot.call_ask_qty = aq
-                    snapshot.total_call_oi = float(
-                        sum(float(x.get("call_options", {}).get("market_data", {}).get("oi", 0.0)) for x in chain)
-                    )
-                    snapshot.total_put_oi = float(
-                        sum(float(x.get("put_options", {}).get("market_data", {}).get("oi", 0.0)) for x in chain)
-                    )
-                    snapshot.pcr = (
-                        snapshot.total_put_oi / snapshot.total_call_oi if snapshot.total_call_oi > 0 else 0.0
-                    )
+                    snapshot.total_call_oi = float(sum(float(x.get("call_options", {}).get("market_data", {}).get("oi", 0.0)) for x in chain))
+                    snapshot.total_put_oi = float(sum(float(x.get("put_options", {}).get("market_data", {}).get("oi", 0.0)) for x in chain))
+                    snapshot.pcr = snapshot.total_put_oi / snapshot.total_call_oi if snapshot.total_call_oi > 0 else 0.0
                     snapshot.iv = float(
                         statistics.mean(
                             [
@@ -1103,6 +1281,7 @@ class ProScalperEngine:
                     regime = self._compute_regime(symbol)
                     micro = self._microstructure(symbol, snapshot)
                     scored = self._score_trade_quality(symbol, snapshot, regime, micro)
+                    session_intel = self._build_session_intelligence(symbol, regime)
                     self.last_signal[symbol] = {
                         "symbol": symbol,
                         "session": session.value,
@@ -1113,6 +1292,7 @@ class ProScalperEngine:
                         "features": scored.get("features", {}),
                         "microstructure": micro,
                         "heatmap": self.heatmaps[symbol],
+                        "session_intelligence": session_intel,
                         "timestamp": time.time(),
                     }
                     self.model.append_observation(scored.get("features", {}))
@@ -1141,8 +1321,15 @@ class ProScalperEngine:
                             },
                         }
                     )
+
+                self.session_intelligence["global"] = {
+                    "session": session.value,
+                    "gift": await self._gift_influence(),
+                    "timestamp": time.time(),
+                }
                 self.runtime.last_analysis_ts = time.time()
-                self.runtime.stale_feed = (time.time() - self.runtime.last_analysis_ts) > self.risk.stale_data_seconds
+                latest_snapshot_ts = max((x.updated_at for x in self.snapshots.values()), default=0.0)
+                self.runtime.stale_feed = (time.time() - latest_snapshot_ts) > self.risk.stale_data_seconds
             except Exception as exc:
                 logger.error("Market analysis loop error: %s", exc)
                 self.runtime.broker_state = BrokerState.DISCONNECTED
@@ -1151,11 +1338,27 @@ class ProScalperEngine:
             await asyncio.sleep(max(0.0, POLL_INTERVAL_SECONDS - elapsed))
 
     def _portfolio_exposure_pct(self) -> float:
-        exposure = 0.0
-        for trade in self.active_trades.values():
-            exposure += trade.entry_price * trade.quantity
+        exposure = sum(trade.entry_price * trade.quantity for trade in self.active_trades.values())
         cap = max(self.risk.trading_capital, 1.0)
         return float(np.clip(exposure / cap, 0.0, 2.0))
+
+    def _symbol_exposure_pct(self, symbol: str) -> float:
+        exposure = sum(trade.entry_price * trade.quantity for trade in self.active_trades.values() if trade.symbol == symbol)
+        cap = max(self.risk.trading_capital, 1.0)
+        return float(np.clip(exposure / cap, 0.0, 2.0))
+
+    def _cross_symbol_correlation(self) -> float:
+        n_spot = list(self.series["NIFTY"]["spot"])
+        s_spot = list(self.series["SENSEX"]["spot"])
+        min_len = min(len(n_spot), len(s_spot), 80)
+        if min_len < 20:
+            return 0.0
+        n = np.array(n_spot[-min_len:])
+        s = np.array(s_spot[-min_len:])
+        n_ret = np.diff(n) / np.maximum(n[:-1], 1e-9)
+        s_ret = np.diff(s) / np.maximum(s[:-1], 1e-9)
+        corr = np.corrcoef(n_ret, s_ret)[0, 1]
+        return float(corr) if not np.isnan(corr) else 0.0
 
     def _allowed_to_trade(self) -> Tuple[bool, str]:
         if self.runtime.safe_mode:
@@ -1174,6 +1377,8 @@ class ProScalperEngine:
             return False, "LOSS_COOLDOWN_ACTIVE"
         if self.performance["daily_drawdown_pct"] >= self.risk.max_daily_drawdown_pct:
             return False, "MAX_DRAWDOWN_REACHED"
+        if len(self.active_trades) >= 2 and self._cross_symbol_correlation() > 0.95:
+            return False, "CORRELATION_PROTECTION_TRIGGERED"
         return True, "OK"
 
     def _trade_qty(self, symbol: str, premium: float) -> int:
@@ -1195,6 +1400,7 @@ class ProScalperEngine:
             signal.get("features", {}).get("gamma_bias", 0.0) > -0.2,
             signal.get("ai", {}).get("ai_confidence", 0.0) >= self.risk.ai_threshold,
             signal.get("tqs", 0.0) >= self.risk.ai_threshold,
+            signal.get("microstructure", {}).get("liquidity_sweep_confirmation", 0.0) >= 1.0,
             signal.get("regime") in {
                 MarketRegime.TRENDING.value,
                 MarketRegime.BREAKOUT.value,
@@ -1206,6 +1412,9 @@ class ProScalperEngine:
             return {"ok": False, "reason": reason if not can_trade else "ENTRY_CONDITIONS_NOT_MET"}
         if not snapshot.call_instrument_key or not snapshot.call_ltp:
             return {"ok": False, "reason": "CALL_INSTRUMENT_UNAVAILABLE"}
+        if self._symbol_exposure_pct(symbol) > self.risk.max_symbol_concentration_pct:
+            return {"ok": False, "reason": "SYMBOL_CONCENTRATION_LIMIT"}
+
         qty = quantity_override or self._trade_qty(symbol, snapshot.call_ltp)
         if qty <= 0:
             return {"ok": False, "reason": "QUANTITY_COMPUTED_ZERO"}
@@ -1216,6 +1425,7 @@ class ProScalperEngine:
             return {"ok": False, "reason": "SPREAD_TOO_WIDE"}
         if signal.get("ai", {}).get("expected_slippage", 0.0) > self.risk.slippage_kill_switch_points:
             return {"ok": False, "reason": "SLIPPAGE_GUARD_TRIGGERED"}
+
         limit_px = float(snapshot.call_ask or snapshot.call_ltp)
         if order_type == "LIMIT":
             limit_px = float(limit_px + max(0.05, spread * 0.25))
@@ -1265,8 +1475,6 @@ class ProScalperEngine:
 
     async def _place_exit(self, trade: TradeRecord, reason: str) -> None:
         snapshot = self.snapshots[trade.symbol]
-        if not trade.instrument_token:
-            return
         spread = max(0.0, (snapshot.call_ask or snapshot.call_ltp or 0.0) - (snapshot.call_bid or snapshot.call_ltp or 0.0))
         order_type = "MARKET" if spread > 1.0 else "LIMIT"
         px = float(snapshot.call_bid or snapshot.call_ltp or trade.entry_price)
@@ -1320,7 +1528,7 @@ class ProScalperEngine:
             self.performance["rejection_count"] += 1
 
     async def _manage_trailing(self) -> None:
-        for trade_id, trade in list(self.active_trades.items()):
+        for trade in list(self.active_trades.values()):
             snapshot = self.snapshots[trade.symbol]
             ltp = snapshot.call_ltp
             if not ltp:
@@ -1352,8 +1560,7 @@ class ProScalperEngine:
             if self.runtime.safe_mode:
                 await self._place_exit(trade, "SAFE_MODE_EXIT")
                 continue
-            max_holding_seconds = 180
-            if time.time() - trade.entry_ts > max_holding_seconds:
+            if time.time() - trade.entry_ts > 180:
                 await self._place_exit(trade, "TIME_STOP")
 
     async def _execution_loop(self) -> None:
@@ -1372,25 +1579,21 @@ class ProScalperEngine:
                         continue
                     if signal.get("tqs", 0.0) < self.risk.ai_threshold:
                         continue
-                    entry = await self._place_entry(symbol)
-                    if not entry.get("ok"):
-                        continue
+                    await self._place_entry(symbol)
             except Exception as exc:
                 logger.error("Execution loop failure: %s", exc)
                 self.set_safe_mode(True, f"Execution failure: {exc}")
             await asyncio.sleep(1)
 
     def _live_unrealized(self) -> float:
-        total = 0.0
-        for trade in self.active_trades.values():
-            ltp = self.snapshots[trade.symbol].call_ltp or trade.entry_price
-            total += (ltp - trade.entry_price) * trade.quantity
-        return total
+        return sum(
+            ((self.snapshots[trade.symbol].call_ltp or trade.entry_price) - trade.entry_price) * trade.quantity
+            for trade in self.active_trades.values()
+        )
 
     def _execution_quality(self) -> Dict[str, float]:
-        rejection_rate = (
-            self.performance["rejection_count"]
-            / max(self.performance["rejection_count"] + self.performance["fill_count"], 1)
+        rejection_rate = self.performance["rejection_count"] / max(
+            self.performance["rejection_count"] + self.performance["fill_count"], 1
         )
         fill_drift = float(np.mean(self.performance["slippage_history"])) if self.performance["slippage_history"] else 0.0
         exec_latency = (
@@ -1408,6 +1611,9 @@ class ProScalperEngine:
         while True:
             try:
                 quality = self._execution_quality()
+                ws_age = time.time() - self.runtime.last_ws_message_ts if self.runtime.last_ws_message_ts else 999.0
+                if self.runtime.websocket_alive and ws_age > (self.risk.stale_data_seconds + 2):
+                    self.set_safe_mode(True, "Market websocket stale")
                 if quality["rejection_rate"] > 0.4 or quality["fill_drift"] > self.risk.slippage_kill_switch_points:
                     self.set_safe_mode(True, "Execution quality deteriorated")
                 payload = {
@@ -1425,6 +1631,14 @@ class ProScalperEngine:
             except Exception as exc:
                 logger.warning("Telemetry loop issue: %s", exc)
             await asyncio.sleep(2)
+
+    def _backtesting_snapshot(self) -> Dict[str, Any]:
+        recent = self.db.recent_ticks(limit=200)
+        return {
+            "total_records": len(recent),
+            "recent_replay": recent[:80],
+            "cursor": self.backtest_cursor,
+        }
 
     def _dashboard_payload(self) -> Dict[str, Any]:
         unrealized = self._live_unrealized()
@@ -1450,12 +1664,16 @@ class ProScalperEngine:
                 "rejection_rate": quality["rejection_rate"],
                 "fill_drift": quality["fill_drift"],
                 "execution_latency_ms": quality["execution_latency_ms"],
+                "exposure_pct": self._portfolio_exposure_pct(),
+                "cross_symbol_correlation": self._cross_symbol_correlation(),
             },
             "signals": self.last_signal,
+            "session_intelligence": self.session_intelligence,
             "snapshots": {k: v.__dict__ for k, v in self.snapshots.items()},
             "active_trades": [x.__dict__ for x in self.active_trades.values()],
             "recent_trades": [x.__dict__ for x in list(self.closed_trades)[-40:]],
             "heatmaps": self.heatmaps,
+            "backtesting": self._backtesting_snapshot(),
         }
 
     async def _broadcast_loop(self) -> None:
@@ -1497,7 +1715,6 @@ class ProScalperEngine:
 
     async def manual_order(self, payload: OrderRequestPayload) -> Dict[str, Any]:
         symbol = payload.symbol
-        snap = self.snapshots[symbol]
         if payload.order_type == "MARKET":
             self.last_signal[symbol].setdefault("features", {})["breakout_velocity"] = 0.02
         qty = payload.quantity_lots * self.symbol_map[symbol]["lot_size"]
@@ -1505,7 +1722,7 @@ class ProScalperEngine:
 
 
 engine = ProScalperEngine()
-app = FastAPI(title="PRO SCALPER", version="1.0.0")
+app = FastAPI(title="PRO SCALPER", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
