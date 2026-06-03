@@ -13,10 +13,10 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { createChart } from "lightweight-charts";
+import { AreaSeries, createChart } from "lightweight-charts";
 
-const WS_URL = import.meta.env.VITE_WS_URL || "ws://localhost:8000/ws/dashboard";
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const WS_URL = import.meta.env.VITE_WS_URL || "";
+const API_URL = import.meta.env.VITE_API_URL || "";
 
 const moduleLabels = [
   "Execution HUD",
@@ -82,29 +82,41 @@ function Stat({ label, value, danger = false }) {
 function useLwChart(containerRef, history) {
   useEffect(() => {
     if (!containerRef.current) return;
-    const chart = createChart(containerRef.current, {
-      width: containerRef.current.clientWidth,
-      height: 240,
-      layout: { background: { color: "#020617" }, textColor: "#94a3b8" },
-      rightPriceScale: { borderColor: "#334155" },
-      timeScale: { borderColor: "#334155", timeVisible: true, secondsVisible: true },
-      grid: { vertLines: { color: "#0f172a" }, horzLines: { color: "#0f172a" } },
-    });
-    const series = chart.addAreaSeries({
-      lineColor: "#06b6d4",
-      topColor: "rgba(6,182,212,0.25)",
-      bottomColor: "rgba(6,182,212,0.0)",
-      lineWidth: 2,
-    });
-    series.setData(history);
+    let chart;
+    let series;
+    try {
+      chart = createChart(containerRef.current, {
+        width: containerRef.current.clientWidth,
+        height: 240,
+        layout: { background: { color: "#020617" }, textColor: "#94a3b8" },
+        rightPriceScale: { borderColor: "#334155" },
+        timeScale: { borderColor: "#334155", timeVisible: true, secondsVisible: true },
+        grid: { vertLines: { color: "#0f172a" }, horzLines: { color: "#0f172a" } },
+      });
+      const areaOptions = {
+        lineColor: "#06b6d4",
+        topColor: "rgba(6,182,212,0.25)",
+        bottomColor: "rgba(6,182,212,0.0)",
+        lineWidth: 2,
+      };
+      series =
+        typeof chart.addAreaSeries === "function"
+          ? chart.addAreaSeries(areaOptions)
+          : chart.addSeries(AreaSeries, areaOptions);
+      series.setData(history);
+    } catch (error) {
+      console.error("Lightweight chart init failed", error);
+      return;
+    }
+
     const resize = () => {
-      if (!containerRef.current) return;
+      if (!containerRef.current || !chart) return;
       chart.applyOptions({ width: containerRef.current.clientWidth });
     };
     window.addEventListener("resize", resize);
     return () => {
       window.removeEventListener("resize", resize);
-      chart.remove();
+      if (chart) chart.remove();
     };
   }, [containerRef, history]);
 }
@@ -137,13 +149,42 @@ export default function App() {
   const runtime = payload.runtime || {};
   const sessionIntel = payload.session_intelligence?.[selectedSymbol] || {};
 
+  const resolvedWsUrl = useMemo(() => {
+    if (WS_URL) return WS_URL;
+    if (!API_URL) return "";
+    try {
+      const u = new URL(API_URL);
+      u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
+      u.pathname = "/ws/dashboard";
+      u.search = "";
+      u.hash = "";
+      return u.toString();
+    } catch {
+      return "";
+    }
+  }, []);
+
+  const missingEndpointConfig = !API_URL && !resolvedWsUrl;
+
   useLwChart(chartRef, priceSeries);
 
   useEffect(() => {
     let ws;
     let alive = true;
+
+    if (!resolvedWsUrl) {
+      setConnected(false);
+      return () => {};
+    }
+
     const connect = () => {
-      ws = new WebSocket(WS_URL);
+      try {
+        ws = new WebSocket(resolvedWsUrl);
+      } catch (error) {
+        console.error("WebSocket init failed", error);
+        setConnected(false);
+        return;
+      }
       ws.onopen = () => setConnected(true);
       ws.onclose = () => {
         setConnected(false);
@@ -169,7 +210,7 @@ export default function App() {
       alive = false;
       if (ws) ws.close();
     };
-  }, [selectedSymbol]);
+  }, [selectedSymbol, resolvedWsUrl]);
 
   const sessionBadge = useMemo(() => {
     const m = {
@@ -248,6 +289,7 @@ export default function App() {
   const replayPoint = backtestRows[replayCursor] || {};
 
   const postConfig = async (body) => {
+    if (!API_URL) return;
     await fetch(`${API_URL}/api/config`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -278,6 +320,12 @@ export default function App() {
             <span className={`rounded px-2 py-1 text-xs ${runtime.safe_mode ? "bg-rose-700/80" : "bg-emerald-700/70"}`}>{runtime.safe_mode ? "SAFE MODE" : "LIVE EXECUTION"}</span>
           </div>
         </motion.div>
+
+        {missingEndpointConfig && (
+          <div className="mb-3 rounded-lg border border-amber-700 bg-amber-900/30 px-3 py-2 text-sm text-amber-200">
+            Frontend endpoint variables are missing. Set <span className="font-semibold">VITE_API_URL</span> and <span className="font-semibold">VITE_WS_URL</span> in Vercel and redeploy.
+          </div>
+        )}
 
         {runtime.safe_mode && (
           <div className="mb-3 rounded-lg border border-rose-700 bg-rose-900/30 px-3 py-2 text-sm text-rose-200">
