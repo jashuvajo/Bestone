@@ -1909,6 +1909,27 @@ class ProScalperEngine:
         qty = payload.quantity_lots * self.symbol_map[symbol]["lot_size"]
         return await self._place_entry(symbol, force=payload.force, quantity_override=qty)
 
+    async def emergency_stop(self, exit_open_positions: bool = True) -> Dict[str, Any]:
+        self.runtime.auto_trading_enabled = False
+        self.set_safe_mode(True, "Manual STOP by operator")
+        exited_trades = 0
+        errors: List[str] = []
+        if exit_open_positions:
+            for trade in list(self.active_trades.values()):
+                try:
+                    await self._place_exit(trade, "MANUAL_EMERGENCY_STOP")
+                    exited_trades += 1
+                except Exception as exc:
+                    errors.append(str(exc))
+        return {
+            "auto_trading_enabled": self.runtime.auto_trading_enabled,
+            "safe_mode": self.runtime.safe_mode,
+            "reason": self.runtime.broker_reason,
+            "exited_trades": exited_trades,
+            "remaining_active_trades": len(self.active_trades),
+            "errors": errors,
+        }
+
 
 engine = ProScalperEngine()
 app = FastAPI(title="PRO SCALPER", version="1.1.0")
@@ -1963,6 +1984,11 @@ async def set_trading(enabled: bool) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Cannot enable trading while SAFE MODE is active.")
     engine.runtime.auto_trading_enabled = enabled
     return {"auto_trading_enabled": engine.runtime.auto_trading_enabled}
+
+
+@app.post("/api/trading/stop")
+async def emergency_stop(exit_open_positions: bool = True) -> Dict[str, Any]:
+    return await engine.emergency_stop(exit_open_positions=exit_open_positions)
 
 
 @app.get("/api/broker/status")

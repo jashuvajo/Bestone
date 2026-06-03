@@ -299,6 +299,11 @@ export default function App() {
     });
   };
 
+  const stopAutoTrading = async () => {
+    if (!API_URL) return;
+    await fetch(`${API_URL}/api/trading/stop`, { method: "POST" });
+  };
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
       <div className="mx-auto max-w-[1900px] p-3">
@@ -350,6 +355,12 @@ export default function App() {
               <div className="mt-2 flex flex-col gap-2 text-xs">
                 <button className="rounded bg-emerald-700/70 px-2 py-1" onClick={() => fetch(`${API_URL}/api/trading/true`, { method: "POST" })}>Enable Auto</button>
                 <button className="rounded bg-rose-700/70 px-2 py-1" onClick={() => fetch(`${API_URL}/api/trading/false`, { method: "POST" })}>Disable Auto</button>
+                <button
+                  className="rounded bg-red-700/90 px-2 py-1 font-semibold"
+                  onClick={stopAutoTrading}
+                >
+                  STOP AUTO TRADING
+                </button>
                 <button
                   className="rounded bg-cyan-700/70 px-2 py-1"
                   onClick={() =>
