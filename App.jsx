@@ -150,6 +150,8 @@ export default function App() {
   const sessionIntel = payload.session_intelligence?.[selectedSymbol] || {};
   const formatTs = (ts) => (ts ? new Date(ts * 1000).toLocaleString() : "NA");
   const tomorrowWatchlist = sessionIntel.tomorrow_watchlist || [];
+  const premarketPlan = sessionIntel.premarket_plan || {};
+  const cacheMeta = payload.cache || {};
 
   const resolvedWsUrl = useMemo(() => {
     if (WS_URL) return WS_URL;
@@ -331,6 +333,12 @@ export default function App() {
         {missingEndpointConfig && (
           <div className="mb-3 rounded-lg border border-amber-700 bg-amber-900/30 px-3 py-2 text-sm text-amber-200">
             Frontend endpoint variables are missing. Set <span className="font-semibold">VITE_API_URL</span> and <span className="font-semibold">VITE_WS_URL</span> in Vercel and redeploy.
+          </div>
+        )}
+
+        {cacheMeta.loaded && !runtime.rest_api_alive && (
+          <div className="mb-3 rounded-lg border border-cyan-700 bg-cyan-900/20 px-3 py-2 text-sm text-cyan-200">
+            Showing cached last-known market data from <span className="font-semibold">{formatTs(cacheMeta.last_cached_ts || 0)}</span> while waiting for Upstox REST reconnect.
           </div>
         )}
 
@@ -587,6 +595,9 @@ export default function App() {
                   <div>Gap vs Prev Close: {Number(sessionIntel.gap_pct_vs_prev_close || 0).toFixed(2)}%</div>
                   <div>Expected Drive: {Number(sessionIntel.expected_opening_drive || 0).toFixed(2)}</div>
                   <div>GIFT Change: {Number(payload.session_intelligence?.global?.gift?.change_pct || 0).toFixed(2)}%</div>
+                  <div>Premarket Enabled: {String(premarketPlan.enabled || false)}</div>
+                  <div>Opening Bias: {premarketPlan.opening_bias || "NA"}</div>
+                  <div className="text-slate-400">{premarketPlan.execution_note || ""}</div>
                   <div className="mt-2 text-cyan-300">Tomorrow Watchlist:</div>
                   {tomorrowWatchlist.length === 0 ? (
                     <div className="text-slate-400">No candidates yet</div>

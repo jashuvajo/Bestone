@@ -542,6 +542,25 @@ class DatabaseStore:
             for row in rows
         ]
 
+    def latest_symbol_state(self, symbol: str) -> Dict[str, Any]:
+        cursor = self._sqlite.execute(
+            """
+            SELECT ts, raw_json FROM ticks
+            WHERE symbol = ?
+            ORDER BY ts DESC
+            LIMIT 1
+            """,
+            (symbol,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        try:
+            raw = json.loads(row[1] or "{}")
+        except Exception:
+            raw = {}
+        return {"ts": row[0], "raw": raw}
+
 
 class ModelEngine:
     def __init__(self) -> None:
@@ -706,6 +725,40 @@ class ProScalperEngine:
         self.backtest_cursor = 0
         self.expiry_refresh_ts: Dict[str, float] = {"NIFTY": 0.0, "SENSEX": 0.0}
         self.broker_diagnostics: Dict[str, Any] = {"last_profile": {}, "last_portfolio_error": "", "last_analysis_error": ""}
+        self.cached_state_loaded = False
+        self.last_cached_state_ts = 0.0
+
+    def _restore_cached_market_state(self) -> None:
+        restored = 0
+        latest_ts = 0.0
+        for symbol in self.symbol_map:
+            cached = self.db.latest_symbol_state(symbol)
+            if not cached:
+                continue
+            raw = cached.get("raw", {})
+            snapshot_raw = raw.get("snapshot", {}) if isinstance(raw, dict) else {}
+            signal_raw = raw.get("signal", {}) if isinstance(raw, dict) else {}
+            ts = float(cached.get("ts") or 0.0)
+            snapshot = self.snapshots[symbol]
+            for field_name in snapshot.__dataclass_fields__.keys():
+                if field_name in snapshot_raw and snapshot_raw[field_name] is not None:
+                    setattr(snapshot, field_name, snapshot_raw[field_name])
+            snapshot.updated_at = max(snapshot.updated_at, ts)
+            if signal_raw:
+                self.last_signal[symbol] = signal_raw
+                if signal_raw.get("heatmap"):
+                    self.heatmaps[symbol] = signal_raw.get("heatmap", {})
+                if signal_raw.get("session_intelligence"):
+                    self.session_intelligence[symbol] = signal_raw.get("session_intelligence", {})
+            restored += 1
+            latest_ts = max(latest_ts, ts)
+
+        if restored > 0:
+            self.cached_state_loaded = True
+            self.last_cached_state_ts = latest_ts
+            if not self.runtime.rest_api_alive:
+                self.runtime.broker_reason = f"Using cached market state ({restored} symbols)"
+            logger.info("Loaded cached market state for %d symbols.", restored)
 
     def set_safe_mode(self, enabled: bool, reason: str) -> None:
         self.runtime.safe_mode = enabled
@@ -733,6 +786,7 @@ class ProScalperEngine:
         return SessionState.CLOSED
 
     async def startup(self) -> None:
+        self._restore_cached_market_state()
         strict_startup_auth = os.getenv("STRICT_STARTUP_AUTH", "false").lower() == "true"
         if strict_startup_auth:
             self.client.authenticate()
@@ -1263,6 +1317,15 @@ class ProScalperEngine:
                 tomorrow_watchlist.append({"strike": strike, "distance_from_atm": distance, "liquidity_score": liq_score, "gamma_score": gamma_score})
         tomorrow_watchlist = sorted(tomorrow_watchlist, key=lambda x: (x["distance_from_atm"], -x["liquidity_score"], -x["gamma_score"]))[:6]
 
+        opening_bias = "BULLISH" if overnight_sentiment > 10 else "BEARISH" if overnight_sentiment < -10 else "NEUTRAL"
+        premarket_plan = {
+            "enabled": session == SessionState.PREMARKET,
+            "opening_bias": opening_bias,
+            "priority_strikes": [x.get("strike") for x in tomorrow_watchlist[:3]],
+            "execution_note": "Wait for spread tightening + liquidity sweep confirmation before entry",
+            "risk_note": "No auto execution unless LIVE session and websocket healthy",
+        }
+
         result = {
             "symbol": symbol,
             "session": session.value,
@@ -1277,6 +1340,7 @@ class ProScalperEngine:
             },
             "support_resistance": {"support": support, "resistance": resistance},
             "expected_opening_drive": expected_drive,
+            "premarket_plan": premarket_plan,
             "tomorrow_watchlist": tomorrow_watchlist,
             "regime": regime.value,
             "post_market_review": {
@@ -1459,6 +1523,8 @@ class ProScalperEngine:
                 self.session_intelligence["global"] = {
                     "session": session.value,
                     "gift": await self._gift_influence(),
+                    "cached_state_loaded": self.cached_state_loaded,
+                    "last_cached_state_ts": self.last_cached_state_ts,
                     "timestamp": time.time(),
                 }
                 self.runtime.last_analysis_ts = time.time()
@@ -1862,6 +1928,7 @@ class ProScalperEngine:
             "recent_trades": [x.__dict__ for x in list(self.closed_trades)[-40:]],
             "heatmaps": self.heatmaps,
             "backtesting": self._backtesting_snapshot(),
+            "cache": {"loaded": self.cached_state_loaded, "last_cached_ts": self.last_cached_state_ts},
             "broker_diagnostics": self.broker_diagnostics,
         }
 
