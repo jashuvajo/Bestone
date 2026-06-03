@@ -70,6 +70,21 @@ const defaultPayload = {
   backtesting: { total_records: 0, recent_replay: [] },
 };
 
+const LOCAL_CACHE_KEY = "pro-scalper:last-dashboard-payload";
+
+function readCachedPayload() {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(LOCAL_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 function Stat({ label, value, danger = false }) {
   return (
     <div className="rounded-md bg-slate-950/70 px-2 py-1">
@@ -122,9 +137,10 @@ function useLwChart(containerRef, history) {
 }
 
 export default function App() {
-  const [payload, setPayload] = useState(defaultPayload);
+  const [payload, setPayload] = useState(() => readCachedPayload() || defaultPayload);
   const [selectedSymbol, setSelectedSymbol] = useState("NIFTY");
   const [connected, setConnected] = useState(false);
+  const [usingBrowserCache, setUsingBrowserCache] = useState(() => Boolean(readCachedPayload()));
   const [priceSeries, setPriceSeries] = useState([]);
   const [aiHistory, setAiHistory] = useState([]);
   const [riskEdit, setRiskEdit] = useState({
@@ -152,6 +168,15 @@ export default function App() {
   const tomorrowWatchlist = sessionIntel.tomorrow_watchlist || [];
   const premarketPlan = sessionIntel.premarket_plan || {};
   const cacheMeta = payload.cache || {};
+  const funds = payload.portfolio?.funds || {};
+  const equityFunds = funds.equity || {};
+  const availableCapital = Number(
+    equityFunds.available_margin ?? equityFunds.available ?? funds.available_margin ?? funds.available ?? 0,
+  );
+  const usedMargin = Number(
+    equityFunds.used_margin ?? equityFunds.utilised_debits ?? funds.used_margin ?? funds.utilised_debits ?? 0,
+  );
+  const snapshotUpdatedAt = Number(snap.updated_at || payload.timestamp || 0);
 
   const resolvedWsUrl = useMemo(() => {
     if (WS_URL) return WS_URL;
@@ -197,6 +222,14 @@ export default function App() {
       ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
         setPayload(data);
+        setUsingBrowserCache(false);
+        try {
+          if (typeof window !== "undefined") {
+            window.localStorage.setItem(LOCAL_CACHE_KEY, JSON.stringify(data));
+          }
+        } catch {
+          // Ignore browser storage failures and continue live rendering.
+        }
 
         const now = Math.floor(data.timestamp || Date.now() / 1000);
         const px = data.snapshots?.[selectedSymbol]?.spot_ltp;
@@ -345,6 +378,12 @@ export default function App() {
           </div>
         )}
 
+        {usingBrowserCache && !connected && payload.timestamp > 0 && (
+          <div className="mb-3 rounded-lg border border-violet-700 bg-violet-900/20 px-3 py-2 text-sm text-violet-200">
+            Websocket is down, so the dashboard is showing your browser-cached paused state from <span className="font-semibold">{formatTs(payload.timestamp || 0)}</span>.
+          </div>
+        )}
+
         {runtime.safe_mode && (
           <div className="mb-3 rounded-lg border border-rose-700 bg-rose-900/30 px-3 py-2 text-sm text-rose-200">
             Broker disconnected or protections triggered. Auto trading is blocked. Reason: <span className="font-semibold">{runtime.broker_reason}</span>
@@ -399,6 +438,8 @@ export default function App() {
                   <Stat label="Spot LTP" value={Number(snap.spot_ltp || 0).toFixed(2)} />
                   <Stat label="ATM Strike" value={Number(snap.atm_strike || 0).toFixed(2)} />
                   <Stat label="Call LTP" value={Number(snap.call_ltp || 0).toFixed(2)} />
+                  <Stat label="Put LTP" value={Number(snap.put_ltp || 0).toFixed(2)} />
+                  <Stat label="Last Tick" value={formatTs(snapshotUpdatedAt)} />
                   <Stat label="TQS" value={Number(signal.tqs || 0).toFixed(2)} danger={Number(signal.tqs || 0) < Number(payload.risk_config?.ai_threshold || 65)} />
                   <Stat label="AI Confidence" value={Number(signal.ai?.ai_confidence || 0).toFixed(1)} />
                   <Stat label="Realized PnL" value={Number(perf.realized_pnl || 0).toFixed(2)} danger={Number(perf.realized_pnl || 0) < 0} />
@@ -465,8 +506,8 @@ export default function App() {
               <div className={panelClass}>
                 <div className={tiny}>Upstox Portfolio</div>
                 <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
-                  <Stat label="Available Capital" value={Number(payload.portfolio?.funds?.equity?.available_margin || 0).toFixed(2)} />
-                  <Stat label="Used Margin" value={Number(payload.portfolio?.funds?.equity?.used_margin || 0).toFixed(2)} />
+                  <Stat label="Available Capital" value={availableCapital.toFixed(2)} />
+                  <Stat label="Used Margin" value={usedMargin.toFixed(2)} />
                   <Stat label="Realized PnL" value={Number(perf.realized_pnl || 0).toFixed(2)} danger={Number(perf.realized_pnl || 0) < 0} />
                   <Stat label="Unrealized PnL" value={Number(perf.unrealized_pnl || 0).toFixed(2)} danger={Number(perf.unrealized_pnl || 0) < 0} />
                   <Stat label="Positions" value={payload.portfolio?.positions?.length || 0} />
@@ -530,6 +571,7 @@ export default function App() {
                   </table>
                 </div>
                 <div className="mt-2 text-xs text-slate-300">Support: {heat.support_resistance?.support || "NA"} | Resistance: {heat.support_resistance?.resistance || "NA"}</div>
+                <div className="mt-1 text-xs text-slate-400">Strike tape paused at: {formatTs(snapshotUpdatedAt)}</div>
               </div>
 
               <div className={panelClass}>

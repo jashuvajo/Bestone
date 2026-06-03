@@ -856,8 +856,6 @@ class ProScalperEngine:
             self.runtime.broker_state = BrokerState.CONNECTED
             self.runtime.safe_mode = False
             self.runtime.broker_reason = "Healthy"
-            if not self.runtime.auto_trading_enabled:
-                self.runtime.auto_trading_enabled = True
         logger.info("Broker profile validated: %s", profile.get("data", {}).get("user_id", "unknown"))
 
     def _decode_ws_payload(self, message: Any) -> Optional[str]:
@@ -936,36 +934,66 @@ class ProScalperEngine:
 
     async def _portfolio_refresh_loop(self) -> None:
         while True:
-            try:
-                funds, positions, holdings, orders = await asyncio.gather(
-                    asyncio.to_thread(self.client.get_funds_margin),
-                    asyncio.to_thread(self.client.get_positions),
-                    asyncio.to_thread(self.client.get_holdings),
-                    asyncio.to_thread(self.client.get_orderbook),
-                )
-                self.portfolio_cache = {
-                    "funds": funds.get("data", {}),
-                    "positions": positions.get("data", []),
-                    "holdings": holdings.get("data", []),
-                    "orders": orders.get("data", []),
-                    "updated_at": time.time(),
-                }
+            endpoint_errors: List[str] = []
+            any_success = False
+
+            funds = self.portfolio_cache.get("funds", {})
+            positions = self.portfolio_cache.get("positions", [])
+            holdings = self.portfolio_cache.get("holdings", [])
+            orders = self.portfolio_cache.get("orders", [])
+
+            for label, getter in [
+                ("funds", self.client.get_funds_margin),
+                ("positions", self.client.get_positions),
+                ("holdings", self.client.get_holdings),
+                ("orders", self.client.get_orderbook),
+            ]:
+                try:
+                    response = await asyncio.to_thread(getter)
+                    data = response.get("data")
+                    if label == "funds" and isinstance(data, dict):
+                        funds = data
+                    elif label in {"positions", "holdings", "orders"} and isinstance(data, list):
+                        if label == "positions":
+                            positions = data
+                        elif label == "holdings":
+                            holdings = data
+                        else:
+                            orders = data
+                    any_success = True
+                except Exception as exc:
+                    endpoint_errors.append(f"{label}: {exc}")
+
+            now = time.time()
+            self.portfolio_cache = {
+                "funds": funds,
+                "positions": positions,
+                "holdings": holdings,
+                "orders": orders,
+                "updated_at": now if any_success else self.portfolio_cache.get("updated_at", 0.0),
+            }
+
+            if any_success:
                 self.runtime.rest_api_alive = True
-                self.runtime.last_rest_success_ts = time.time()
-                self.broker_diagnostics["last_portfolio_error"] = ""
+                self.runtime.last_rest_success_ts = now
+                if self.runtime.broker_state == BrokerState.DISCONNECTED:
+                    self.runtime.broker_state = BrokerState.DEGRADED
+                self.broker_diagnostics["last_portfolio_error"] = "; ".join(endpoint_errors)
+                self.runtime.last_error = "; ".join(endpoint_errors[:1]) if endpoint_errors else ""
                 await asyncio.sleep(3)
-            except Exception as exc:
-                err = str(exc)
-                logger.warning("Portfolio refresh failed: %s", err)
-                self.broker_diagnostics["last_portfolio_error"] = err
-                self.runtime.last_error = err
-                if "401" in err or "Unauthorized" in err:
-                    self.runtime.rest_api_alive = False
-                    self.runtime.broker_state = BrokerState.DISCONNECTED
-                else:
-                    self.runtime.broker_state = BrokerState.DEGRADED if self.runtime.rest_api_alive else BrokerState.DISCONNECTED
-                self.set_safe_mode(True, f"Portfolio endpoint failure: {err}")
-                await asyncio.sleep(2)
+                continue
+
+            err = "; ".join(endpoint_errors) if endpoint_errors else "Unknown portfolio refresh failure"
+            logger.warning("Portfolio refresh failed: %s", err)
+            self.broker_diagnostics["last_portfolio_error"] = err
+            self.runtime.last_error = err
+            if "401" in err or "Unauthorized" in err:
+                self.runtime.rest_api_alive = False
+                self.runtime.broker_state = BrokerState.DISCONNECTED
+            else:
+                self.runtime.broker_state = BrokerState.DEGRADED if self.runtime.rest_api_alive else BrokerState.DISCONNECTED
+            self.set_safe_mode(True, f"Portfolio endpoint failure: {err}")
+            await asyncio.sleep(2)
 
     def _nearest_expiry(self, contracts_data: List[Dict[str, Any]]) -> Optional[str]:
         if not contracts_data:
@@ -1640,15 +1668,18 @@ class ProScalperEngine:
 
     def _update_advisory_state(self) -> None:
         session = self.session_state()
-        live_data_available = self.runtime.rest_api_alive and self.runtime.websocket_alive
-        if session == SessionState.LIVE and live_data_available and not self.runtime.auto_trading_enabled:
+        rest_live = self.runtime.rest_api_alive
+        ws_live = self.runtime.websocket_alive
+        can_analyze = rest_live and (ws_live or self.cached_state_loaded)
+        if can_analyze and not self.runtime.auto_trading_enabled:
             suggestions = [self._suggest_trade(symbol) for symbol in ["NIFTY", "SENSEX"]]
             if time.time() - self.last_advisory_backtest_ts > 20:
                 self.advisory_state["backtest"] = self._compute_advisory_backtest()
                 self.last_advisory_backtest_ts = time.time()
+            mode = "ADVISORY_BACKTEST" if session == SessionState.LIVE and ws_live else "ADVISORY_REVIEW"
             self.advisory_state.update(
                 {
-                    "mode": "ADVISORY_BACKTEST",
+                    "mode": mode,
                     "suggestions": suggestions,
                     "updated_at": time.time(),
                 }
